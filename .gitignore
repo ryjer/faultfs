@@ -1,0 +1,11 @@
+# 构建产物
+/faultfs
+*.test
+*.out
+*.exe
+coverage.txt
+coverage.html
+
+# 编辑器 / 系统
+.*.swp
+.DS_Store
