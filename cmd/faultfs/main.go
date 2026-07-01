@@ -6,7 +6,7 @@
 //	add <mp> […]           加注入规则；add badsector <mp> […] 加可修复坏扇区
 //	rm/clear/refresh/list  管理规则（refresh 同时重置 spare 到初始值）
 //	set latency <mp> […]   设备延迟档/倍速/性能参数（设备固有属性，非规则）
-//	set spare <mp> <n>     备用扇区预算（设备固有属性）
+//	set spare <mp> <spec>  备用块预算（设备固有属性；如 8*4KiB）
 //	status/dump            只读快照
 //
 // 设备延迟与备用扇区属于设备固有属性（不能像规则那样增删），故用 set 子命令设置。
@@ -38,6 +38,10 @@ func main() {
 		newClearCmd(), newRefreshCmd(), newListCmd(), newStatusCmd(),
 		newDumpCmd(), newSetCmd(),
 	)
+	// SilenceUsage：cobra 默认在每条 RunE 错误后把整段 Usage:+Flags: 打到 stderr（很噪）。
+	// 置于根命令即全局静默 Usage（cobra ExecuteC 的 !c.SilenceUsage && !cmd.SilenceUsage
+	// 逻辑下，二者其一为真即不打印），仍保留 "Error: <msg>" 一行。
+	root.SilenceUsage = true
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
 	}
@@ -47,6 +51,7 @@ func main() {
 
 func newMountCmd() *cobra.Command {
 	var detach bool
+	var randStr, seqStr, spareStr string
 	c := &cobra.Command{
 		Use:   "mount <backing> <mp>",
 		Short: "挂载一个 faultfs（backing 透传），前台守护；--detach 后台运行",
@@ -54,26 +59,91 @@ func newMountCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			backing, mp := args[0], args[1]
 			if detach {
-				return detachSelf(backing, mp)
+				// detach：把挂载参数透传给 fork 出的守护子进程，由其完成 setup。
+				return detachSelf(backing, mp, mountExtraArgs(cmd))
 			}
-			return faultfs.Run(mp, backing, faultfs.NewInjector())
+			inj, warns, err := buildInjector(backing, randStr, seqStr, spareStr)
+			if err != nil {
+				return err
+			}
+			for _, w := range warns {
+				fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+			}
+			return faultfs.Run(mp, backing, inj)
 		},
 	}
 	c.Flags().BoolVar(&detach, "detach", false, "后台守护，立即返回")
+	c.Flags().StringVar(&randStr, "rand", "", "初始随机寻址延迟（ns/us/ms，如 8ms；空=不启用性能模拟，直透 backing）")
+	c.Flags().StringVar(&seqStr, "seq", "", "初始顺序读写速度（M=MiB/s、G=GiB/s，如 100M；空=不启用）")
+	c.Flags().StringVar(&spareStr, "spare", "", "初始备用块预算（如 8*4KiB = 8 个 4KiB 块；空=0，挂载后用 set spare 设）")
 	return c
+}
+
+// mountExtraArgs 收集 mount 上被显式设置的性能/备用参数，作为透传给 --detach 子进程的
+// 额外命令行参数（保持前台/后台两条路径用同一份参数完成 setup）。
+func mountExtraArgs(cmd *cobra.Command) []string {
+	var args []string
+	for _, name := range []string{"rand", "seq", "spare"} {
+		if cmd.Flags().Changed(name) {
+			v, _ := cmd.Flags().GetString(name)
+			args = append(args, "--"+name, v)
+		}
+	}
+	return args
+}
+
+// buildInjector 按挂载参数构造 *Injector 并设初始 profile/spare（同步 initial 快照，供
+// refresh 复位）。--rand/--seq 至少其一给定则启用性能模拟（按 backing 钳制并返回告警）；
+// --spare 给定则设块预算，否则保持 NewInjector 默认 0。返回 (inj, warns, err)。
+func buildInjector(backing, randStr, seqStr, spareStr string) (*faultfs.Injector, []string, error) {
+	inj := faultfs.NewInjector()
+	var warns []string
+	if randStr != "" || seqStr != "" {
+		var rand time.Duration
+		if randStr != "" {
+			d, err := faultfs.ParseLatency(randStr)
+			if err != nil {
+				return nil, nil, err
+			}
+			rand = d
+		}
+		var seqBw float64
+		if seqStr != "" {
+			bw, err := faultfs.ParseSpeed(seqStr)
+			if err != nil {
+				return nil, nil, err
+			}
+			seqBw = bw
+		}
+		target := faultfs.ProfileFromKnobs(rand, seqBw)
+		warns = append(warns, inj.SetProfileCalibrated(backing, target)...)
+	}
+	if spareStr != "" {
+		count, bs, err := faultfs.ParseSpareSpec(spareStr)
+		if err != nil {
+			return nil, nil, err
+		}
+		inj.SetSpareBlocks(count, bs)
+	}
+	return inj, warns, nil
 }
 
 // detachSelf 重新以非 detach 模式 fork 自身，新会话脱离终端；父进程等待 control
 // socket 就绪后返回，从而 `mount --detach` 一返回即可接收 add/set 等子命令。
-func detachSelf(backing, mp string) error {
+// extraArgs 是透传给子进程的挂载参数（--rand/--seq/--spare），保证后台路径同样完成
+// setup（含按 backing 钳制）。子进程 stderr 继承父进程 stderr：setup（解析参数、
+// 校准、钳制）先于 control socket Listen，故启动期告警会先于 socket 就绪输出，
+// 父进程据此把 warning: 暴露给用户（子进程退出码同样反映失败）。
+func detachSelf(backing, mp string, extraArgs []string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("detach: cannot find executable: %w", err)
 	}
-	c := exec.Command(exe, "mount", backing, mp)
+	args := append([]string{"mount", backing, mp}, extraArgs...)
+	c := exec.Command(exe, args...)
 	c.Stdin = nil
 	c.Stdout = nil
-	c.Stderr = nil
+	c.Stderr = os.Stderr
 	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := c.Start(); err != nil {
 		return fmt.Errorf("detach: %w", err)
@@ -202,13 +272,28 @@ func newClearCmd() *cobra.Command {
 }
 
 func newRefreshCmd() *cobra.Command {
-	return &cobra.Command{
-		Use: "refresh <mp>", Short: "重置所有规则到初始态（healed/remaining/spare）", Args: cobra.ExactArgs(1),
+	var keepLatency bool
+	c := &cobra.Command{
+		Use: "refresh <mp>", Short: "重置所有规则到初始态（healed/remaining/spare，默认含性能参数）", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, err := sendCtl(args[0], control.Req{Cmd: control.CmdRefreshRules})
-			return err
+			resp, err := sendCtl(args[0], control.Req{Cmd: control.CmdRefreshRules, SkipLatency: keepLatency})
+			if err != nil {
+				return err
+			}
+			// 把发生的每条复位/变动打到 stderr（诊断日志，保持 stdout 纯净）：
+			// 不留静默聚合编号，逐条说明哪个规则/spare/latency 变了、前后值。
+			for _, e := range resp.Resets {
+				if e.What == "rule" {
+					fmt.Fprintf(os.Stderr, "reset rule %d: %s -> %s\n", e.ID, e.Before, e.After)
+				} else {
+					fmt.Fprintf(os.Stderr, "reset %s: %s -> %s\n", e.What, e.Before, e.After)
+				}
+			}
+			return nil
 		},
 	}
+	c.Flags().BoolVar(&keepLatency, "keep-latency", false, "保留当前性能参数（profile/speed）不动")
+	return c
 }
 
 func newListCmd() *cobra.Command {
@@ -295,15 +380,15 @@ func newSetLatencyCmd() *cobra.Command {
 
 func newSetSpareCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "spare <mp> <n>",
-		Short: "设置备用扇区预算（-1 无限）；refresh 会还原到该初始值",
+		Use:   "spare <mp> <spec>",
+		Short: "设备用块预算（<count>*<size> 如 8*4KiB，或纯数量如 8；-1 无限）；refresh 会还原到该初始值",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			n, err := strconv.ParseInt(args[1], 10, 64)
+			count, bs, err := faultfs.ParseSpareSpec(args[1])
 			if err != nil {
-				return fmt.Errorf("n: %w", err)
+				return err
 			}
-			_, err = sendCtl(args[0], control.Req{Cmd: control.CmdSetSpare, Spare: n, HasSpare: true})
+			_, err = sendCtl(args[0], control.Req{Cmd: control.CmdSetSpare, Spare: count, SpareBlockSize: bs, HasSpare: true})
 			return err
 		},
 	}
@@ -312,17 +397,22 @@ func newSetSpareCmd() *cobra.Command {
 func newBadsectorCmd() *cobra.Command {
 	var path string
 	var off, length int64
-	var spare int
+	var spare string
 	c := &cobra.Command{
 		Use: "badsector <mp>", Short: "标记坏扇区（read EIO，write 治愈）：封装为 --heal-on-write read 规则", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			mp := args[0]
 			// 先设 spare（如指定）：坏扇区规则由 write 触发治愈并消耗 spare，故 spare 必须在
 			// 规则生效前就位。若先加规则、后设 spare 且后者失败，规则会带着非预期的 spare
-			// （可能 -1 无限）留存，治愈静默不消耗预算。故先设 spare：规则添加失败时最多留下
-			// 用户显式指定的 spare（无害的设备属性），不会留下"坏扇区规则 + 错误 spare"。
+			// 留存，治愈静默不消耗预算。故先设 spare：规则添加失败时最多留下用户显式指定的
+			// spare（无害的设备属性），不会留下"坏扇区规则 + 错误 spare"。不带 --spare 时
+			// 不改 spare（保持挂载的默认 0——需先 set spare 才能治愈）。
 			if cmd.Flags().Changed("spare") {
-				if _, err := sendCtl(mp, control.Req{Cmd: control.CmdSetSpare, Spare: int64(spare), HasSpare: true}); err != nil {
+				count, bs, err := faultfs.ParseSpareSpec(spare)
+				if err != nil {
+					return err
+				}
+				if _, err := sendCtl(mp, control.Req{Cmd: control.CmdSetSpare, Spare: count, SpareBlockSize: bs, HasSpare: true}); err != nil {
 					return err
 				}
 			}
@@ -340,8 +430,8 @@ func newBadsectorCmd() *cobra.Command {
 	}
 	c.Flags().StringVar(&path, "path", "", "挂载内相对路径子串（必填）")
 	c.Flags().Int64Var(&off, "off", 0, "坏区起始 offset")
-	c.Flags().Int64Var(&length, "len", 4096, "坏区长度（=OffLen）")
-	c.Flags().IntVar(&spare, "spare", -1, "备用扇区预算（-1 无限）")
+	c.Flags().Int64Var(&length, "len", 4096, "坏区长度（=OffLen；治愈时按 ceil(len/blockSize) 整块消耗备用）")
+	c.Flags().StringVar(&spare, "spare", "", "备用块预算（如 8*4KiB 或 8；-1 无限；不设则不改当前预算）")
 	// --path 必填：空 path 的规则会子串匹配任意文件，对坏扇区这种高危便捷命令而言，
 	// 忘带 --path 而静默生成"全局坏扇区"是不可接受的脚枪，故强制要求显式指定。
 	_ = c.MarkFlagRequired("path")
@@ -351,17 +441,21 @@ func newBadsectorCmd() *cobra.Command {
 // errnoNames 是 syscall.Errno → 名称的映射，可作为 parseErrno 和 errnoName 的
 // 单一真实来源。添加新 errno 时只需更新此 map。
 var errnoNames = map[syscall.Errno]string{
-	syscall.EIO:     "EIO",
-	syscall.ENOSPC:  "ENOSPC",
-	syscall.EROFS:   "EROFS",
-	syscall.ESTALE:  "ESTALE",
-	syscall.ENODEV:  "ENODEV",
-	syscall.EUCLEAN: "EUCLEAN",
-	syscall.EACCES:  "EACCES",
-	syscall.EPERM:   "EPERM",
-	syscall.ENOSYS:  "ENOSYS",
-	syscall.EFBIG:   "EFBIG",
-	syscall.EDQUOT:  "EDQUOT",
+	syscall.EIO:        "EIO",
+	syscall.ENOSPC:     "ENOSPC",
+	syscall.EROFS:      "EROFS",
+	syscall.ESTALE:     "ESTALE",
+	syscall.ENODEV:     "ENODEV",
+	syscall.EUCLEAN:    "EUCLEAN",
+	syscall.EACCES:     "EACCES",
+	syscall.EPERM:      "EPERM",
+	syscall.ENOSYS:     "ENOSYS",
+	syscall.EFBIG:      "EFBIG",
+	syscall.EDQUOT:     "EDQUOT",
+	syscall.ENODATA:    "ENODATA",    // xattr：属性不存在（getxattr/removexattr）
+	syscall.EOPNOTSUPP: "EOPNOTSUPP", // xattr：不支持（filesystem/namespce）
+	syscall.ERANGE:     "ERANGE",     // xattr：缓冲过小（getxattr/listxattr）
+	syscall.E2BIG:      "E2BIG",      // xattr：属性名/值过大
 }
 
 // nameToErrno 在 init 中由 errnoNames 自动构建。
@@ -372,6 +466,9 @@ func init() {
 	for e, n := range errnoNames {
 		nameToErrno[n] = e
 	}
+	// ENOTSUP 与 EOPNOTSUPP 在 Linux 同值；errnoNames 只保留 EOPNOTSUPP（显示用），
+	// 这里补 ENOTSUP 作为解析别名，让 xattr "not supported" 场景两种写法都被接受。
+	nameToErrno["ENOTSUP"] = syscall.EOPNOTSUPP
 }
 
 // parseErrno 把 errno 名（EIO/ENOSPC/...）或数字字符串转 syscall.Errno。无法解析时返回错误。
@@ -402,8 +499,8 @@ func newStatusCmd() *cobra.Command {
 			if asJSON {
 				return writeJSON(resp)
 			}
-			fmt.Printf("rules=%d  spare=%d  speed=%v  profile=%s\n",
-				len(resp.Rules), resp.Spare, resp.Speed, resp.Profile)
+			fmt.Printf("rules=%d  spare=%s  speed=%v  profile=%s\n",
+				len(resp.Rules), faultfs.FormatSpare(resp.Spare, resp.SpareBlockSize), resp.Speed, resp.Profile)
 			for _, r := range resp.Rules {
 				fmt.Printf("  [%d] op=%s path=%q healed=%v rem=%d errno=%d(%s)\n",
 					r.ID, r.Op, r.Path, r.Healed, r.Remaining, r.Errno, errnoName(r.Errno))
@@ -436,8 +533,8 @@ func newDumpCmd() *cobra.Command {
 			d := resp.Dump
 			fmt.Printf("mount_pid=%d\nbacking=%s\nsocket=%s\nmount_time=%s\n",
 				d.MountPID, d.Backing, d.Socket, d.MountTime)
-			fmt.Printf("profile=%s speed=%v spare=%d rules=%d\n",
-				d.ProfileName, d.Speed, d.Spare, len(d.Rules))
+			fmt.Printf("profile=%s speed=%v spare=%s rules=%d\n",
+				d.ProfileName, d.Speed, faultfs.FormatSpare(d.Spare, d.SpareBlockSize), len(d.Rules))
 			for _, r := range d.Rules {
 				fmt.Printf("  [%d] op=%s path=%q off=%d off-len=%d errno=%d(%s) n=%d heal=%v healed=%v rem=%d\n",
 					r.ID, r.Op, r.Path, r.Off, r.OffLen, r.Errno, errnoName(r.Errno),

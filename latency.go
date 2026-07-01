@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -96,11 +97,12 @@ func ProfileByName(name string) (LatencyProfile, bool) {
 	return LatencyProfile{}, false
 }
 
-// SetProfile 设延迟模型（在线可改）。
+// SetProfile 设延迟模型（在线可改）；同步更新初始快照，故 Refresh 会还原到该 profile。
 func (in *Injector) SetProfile(p LatencyProfile) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	in.profile = p
+	in.initialProfile = p
 }
 
 // Profile 返回当前延迟模型。
@@ -111,7 +113,7 @@ func (in *Injector) Profile() LatencyProfile {
 }
 
 // SetSpeed 设全局倍速：1.0 正常、>1 慢放、<1 快放（<=0 视为 1）。实际延迟 =
-// profile 值 × speed。
+// profile 值 × speed。同步更新初始快照，故 Refresh 会还原到该 speed。
 func (in *Injector) SetSpeed(s float64) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
@@ -119,6 +121,7 @@ func (in *Injector) SetSpeed(s float64) {
 		s = 1
 	}
 	in.speed = s
+	in.initialSpeed = s
 }
 
 // Speed 返回当前倍速。
@@ -294,26 +297,26 @@ func profileName(p LatencyProfile) string {
 // 供 dump 序列化展示。
 func profileFields(p LatencyProfile) map[string]string {
 	return map[string]string{
-		"read_rand":    p.ReadRand.String(),
-		"read_seq":     p.ReadSeq.String(),
-		"write_rand":   p.WriteRand.String(),
-		"write_seq":    p.WriteSeq.String(),
-		"open":         p.Open.String(),
-		"getattr":      p.Getattr.String(),
-		"statfs":       p.Statfs.String(),
-		"setattr":      p.Setattr.String(),
-		"getxattr":     p.Getxattr.String(),
-		"setxattr":     p.Setxattr.String(),
-		"removexattr":  p.Removexattr.String(),
-		"listxattr":    p.Listxattr.String(),
-		"create":       p.Create.String(),
-		"mkdir":         p.Mkdir.String(),
-		"unlink":       p.Unlink.String(),
-		"rename":       p.Rename.String(),
-		"fsync":        p.Fsync.String(),
-		"flush":        p.Flush.String(),
-		"read_byte":    byteOrUnlimited(p.ReadByte),
-		"write_byte":   byteOrUnlimited(p.WriteByte),
+		"read_rand":   p.ReadRand.String(),
+		"read_seq":    p.ReadSeq.String(),
+		"write_rand":  p.WriteRand.String(),
+		"write_seq":   p.WriteSeq.String(),
+		"open":        p.Open.String(),
+		"getattr":     p.Getattr.String(),
+		"statfs":      p.Statfs.String(),
+		"setattr":     p.Setattr.String(),
+		"getxattr":    p.Getxattr.String(),
+		"setxattr":    p.Setxattr.String(),
+		"removexattr": p.Removexattr.String(),
+		"listxattr":   p.Listxattr.String(),
+		"create":      p.Create.String(),
+		"mkdir":       p.Mkdir.String(),
+		"unlink":      p.Unlink.String(),
+		"rename":      p.Rename.String(),
+		"fsync":       p.Fsync.String(),
+		"flush":       p.Flush.String(),
+		"read_byte":   byteOrUnlimited(p.ReadByte),
+		"write_byte":  byteOrUnlimited(p.WriteByte),
 	}
 }
 
@@ -361,8 +364,31 @@ func ParseSpeed(s string) (float64, error) {
 	if t == "" {
 		return 0, &knobParseError{kind: "speed", raw: s, hint: "不能为空；示例：100M / 2G / 100MiB/s"}
 	}
-	u := strings.ToLower(t)
-	u = strings.TrimSuffix(u, "/s")
+	t = strings.TrimSuffix(strings.ToLower(t), "/s")
+	bw, err := parseBytesFloat(t)
+	if err != nil {
+		return 0, &knobParseError{kind: "speed", raw: s, hint: "示例：100M / 2G / 100MiB/s（M=MiB/s，G=GiB/s）"}
+	}
+	if math.IsNaN(bw) || math.IsInf(bw, 0) {
+		return 0, &knobParseError{kind: "speed", raw: s, hint: "速度不能为 NaN/Inf"}
+	}
+	if bw < 0 {
+		return 0, &knobParseError{kind: "speed", raw: s, hint: "速度不可为负"}
+	}
+	// bw=0 合法（=不限速）。正带宽须 ≥ 1 B/s：per-byte 延迟 = 1s/bw 以 int64 纳秒存储，
+	// bw<1 会让单字节延迟 >1s（大读挂死）乃至 1s/bw 溢出 int64 回绕成负（被 sleepFor
+	// 当作不延迟，"要慢却变快"）。
+	if bw > 0 && bw < 1 {
+		return 0, &knobParseError{kind: "speed", raw: s, hint: "速度过小（最小 1 B/s；0=不限速）"}
+	}
+	return bw, nil
+}
+
+// parseBytesFloat 解析带可选单位（K/KiB/M/MiB/G/GiB，大小写不敏感）的字节数为 float64；
+// 无单位视为字节。它是 [ParseSpeed]（速率）与 [ParseSpareSpec]（块大小）共用的单位换算核心，
+// 仅做"数字 × 单位"——取值校验（速率下限、块大小整数性等）由各自调用方负责。
+func parseBytesFloat(s string) (float64, error) {
+	u := strings.ToLower(strings.TrimSpace(s))
 	mult := 1.0
 	switch {
 	case strings.HasSuffix(u, "gib"):
@@ -374,28 +400,93 @@ func ParseSpeed(s string) (float64, error) {
 	case strings.HasSuffix(u, "m"):
 		mult, u = MiB, strings.TrimSuffix(u, "m")
 	case strings.HasSuffix(u, "kib"):
-		mult, u = 1 << 10, strings.TrimSuffix(u, "kib")
+		mult, u = 1<<10, strings.TrimSuffix(u, "kib")
 	case strings.HasSuffix(u, "k"):
-		mult, u = 1 << 10, strings.TrimSuffix(u, "k")
+		mult, u = 1<<10, strings.TrimSuffix(u, "k")
 	}
 	f, err := parseFloat(strings.TrimSpace(u))
 	if err != nil {
-		return 0, &knobParseError{kind: "speed", raw: s, hint: "示例：100M / 2G / 100MiB/s（M=MiB/s，G=GiB/s）"}
+		return 0, err
 	}
-	if math.IsNaN(f) || math.IsInf(f, 0) {
-		return 0, &knobParseError{kind: "speed", raw: s, hint: "速度不能为 NaN/Inf"}
+	return f * mult, nil
+}
+
+// ---- 备用块预算规格（块数量 + 块大小）----
+//
+// spare 用「<count>*<size>」表达一份块预算，如 8*4KiB = 8 个 4KiB 的备用块。这比单纯
+// 的"次数"或"字节数"更贴近真实硬盘的备用扇区模型：治愈一段坏区时按块向上取整消耗
+// （见 [Injector] 的 Check）。size 复用速率/块大小的同一套单位（K/M/G/KiB…）；省略 size
+// 时块大小默认 1（= 旧的纯次数语义，向后兼容）。count=-1 表示无限。
+
+// ParseSpareSpec 解析备用块规格字符串为（块数量, 块大小字节）。接受：
+//   - "8*4KiB"/"8*4096" → (8, 4096)
+//   - "8"            → (8, 1)（兼容旧的纯次数语义）
+//   - "-1"           → (-1, 1)（无限）
+//
+// count 必须 ≥ -1（-1=无限）；块大小（若给出）必须是 ≥1 的整数字节。无法解析时返回
+// [knobParseError]（kind=spare），便于 CLI 展示带上下文的提示。
+func ParseSpareSpec(s string) (count, blockSize int64, err error) {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return 0, 0, &knobParseError{kind: "spare", raw: s, hint: "不能为空；示例：8*4KiB / 8 / -1"}
 	}
-	if f < 0 {
-		return 0, &knobParseError{kind: "speed", raw: s, hint: "速度不可为负"}
+	var sizeStr string
+	hasStar := false
+	if idx := strings.Index(t, "*"); idx >= 0 {
+		hasStar = true
+		sizeStr = t[idx+1:]
+		t = t[:idx]
 	}
-	bw := f * mult
-	// bw=0 合法（=不限速）。正带宽须 ≥ 1 B/s：per-byte 延迟 = 1s/bw 以 int64 纳秒存储，
-	// bw<1 会让单字节延迟 >1s（大读挂死）乃至 1s/bw 溢出 int64 回绕成负（被 sleepFor
-	// 当作不延迟，"要慢却变快"）。
-	if bw > 0 && bw < 1 {
-		return 0, &knobParseError{kind: "speed", raw: s, hint: "速度过小（最小 1 B/s；0=不限速）"}
+	n, e := parseStrictInt(strings.TrimSpace(t))
+	if e != nil {
+		return 0, 0, &knobParseError{kind: "spare", raw: s, hint: "块数量须是整数（示例：8*4KiB / 8 / -1）"}
 	}
-	return bw, nil
+	if n < -1 {
+		return 0, 0, &knobParseError{kind: "spare", raw: s, hint: "块数量须 >=0（-1=无限）"}
+	}
+	if !hasStar {
+		return n, 1, nil // 纯数量（兼容旧 <n>），块大小默认 1
+	}
+	bw, perr := parseBytesFloat(sizeStr)
+	if perr != nil {
+		return 0, 0, &knobParseError{kind: "spare", raw: s, hint: "块大小解析失败（示例：4KiB / 4096）"}
+	}
+	if bw < 1 {
+		return 0, 0, &knobParseError{kind: "spare", raw: s, hint: "块大小须 >=1 字节"}
+	}
+	r := math.Round(bw)
+	if math.Abs(bw-r) > 1e-9 {
+		return 0, 0, &knobParseError{kind: "spare", raw: s, hint: "块大小须是整数字节"}
+	}
+	return n, int64(r), nil
+}
+
+// FormatSize 把字节数格式化为人类可读的大小串（最短表示）：>=GiB→GiB、>=MiB→MiB、
+// >=KiB→KiB、否则字节。用于 spare 块大小的展示。
+func FormatSize(b int64) string {
+	switch {
+	case b >= int64(GiB):
+		return trimFloat(float64(b)/GiB) + "GiB"
+	case b >= int64(MiB):
+		return trimFloat(float64(b)/MiB) + "MiB"
+	case b >= 1<<10:
+		return trimFloat(float64(b)/(1<<10)) + "KiB"
+	default:
+		return trimFloat(float64(b)) + "B"
+	}
+}
+
+// FormatSpare 把备用块预算（count 个 blockSize 字节的块）格式化为展示串：
+// count==-1→"unlimited"；blockSize>1→"N*<size>"（如 8*4KiB，与输入格式一致）；
+// 否则"N"。0→"0"。
+func FormatSpare(count, blockSize int64) string {
+	if count == -1 {
+		return "unlimited"
+	}
+	if blockSize > 1 {
+		return strconv.FormatInt(count, 10) + "*" + FormatSize(blockSize)
+	}
+	return strconv.FormatInt(count, 10)
 }
 
 // FormatSpeed 把字节/秒格式化为人类可读的速度串（如 "100MiB/s"、"2.5GiB/s"）。

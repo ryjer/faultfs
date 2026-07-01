@@ -120,3 +120,87 @@ func TestControlOnline_DumpAndStatus(t *testing.T) {
 		t.Fatalf("status rules len = %d, want 1", len(st.Rules))
 	}
 }
+
+// TestControlOnline_RefreshAndSpareBlocks:默认 spare=0；在线 set spare（带块大小）→ dump
+// 反映 blockSize；触发治愈消耗 spare → 在线 refresh 返回 Resets（规则+spare 条目）并复位
+// spare。SkipLatency 路径不产生 latency 条目。
+func TestControlOnline_RefreshAndSpareBlocks(t *testing.T) {
+	inj := NewInjector()
+	mp := MountT(t, inj)
+	sock := control.SocketPath(mp)
+
+	// 默认 spare=0（NewInjector 不再无限）。
+	if st, err := control.Send(sock, control.Req{Cmd: control.CmdStatus}); err != nil || st.Spare != 0 {
+		t.Fatalf("默认 spare = %v/%v, want 0", st.Spare, err)
+	}
+
+	// 在线 set spare 4*4KiB。
+	if _, err := control.Send(sock, control.Req{Cmd: control.CmdSetSpare, Spare: 4, SpareBlockSize: 4096, HasSpare: true}); err != nil {
+		t.Fatalf("set spare: %v", err)
+	}
+	if resp, err := control.Send(sock, control.Req{Cmd: control.CmdDump}); err != nil || resp.Dump.SpareBlockSize != 4096 || resp.Dump.Spare != 4 {
+		t.Fatalf("dump after set spare = %+v/%v", resp, err)
+	}
+
+	// 先建 4KiB 文件，再加坏扇区规则（治愈消耗 1 块）。
+	p := filepath.Join(mp, "b")
+	if err := os.WriteFile(p, make([]byte, 4096), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if ar, err := control.Send(sock, control.Req{Cmd: control.CmdAddRule, Op: OpRead, Path: "b", Off: 0, OffLen: 4096, Errno: int(syscall.EIO), HealOnWrite: true}); err != nil || !ar.OK {
+		t.Fatalf("add badsector rule: %v/%v", ar, err)
+	}
+	// 读 → EIO。
+	f, err := os.Open(p)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := f.ReadAt(make([]byte, 4096), 0); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("read = %v, want EIO", err)
+	}
+	f.Close()
+	// 写 → 治愈，消耗 1 块，spare 4→3。
+	f2, err := os.OpenFile(p, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open w: %v", err)
+	}
+	if _, err := f2.WriteAt([]byte("x"), 0); err != nil {
+		t.Fatalf("write heal = %v, want nil", err)
+	}
+	f2.Close()
+	if st, _ := control.Send(sock, control.Req{Cmd: control.CmdStatus}); st.Spare != 3 {
+		t.Fatalf("spare after heal = %d, want 3", st.Spare)
+	}
+
+	// 在线 refresh → 返回 Resets（含 rule 与 spare 条目），spare 复位到 4。
+	rr, err := control.Send(sock, control.Req{Cmd: control.CmdRefreshRules})
+	if err != nil || !rr.OK {
+		t.Fatalf("refresh: %v/%v", rr, err)
+	}
+	var sawRule, sawSpare bool
+	for _, e := range rr.Resets {
+		if e.What == "rule" {
+			sawRule = true
+		}
+		if e.What == "spare" {
+			sawSpare = true
+		}
+	}
+	if !sawRule {
+		t.Errorf("refresh Resets 缺少 rule 条目：%+v", rr.Resets)
+	}
+	if !sawSpare {
+		t.Errorf("refresh Resets 缺少 spare 条目：%+v", rr.Resets)
+	}
+	if st, _ := control.Send(sock, control.Req{Cmd: control.CmdStatus}); st.Spare != 4 {
+		t.Fatalf("spare after refresh = %d, want 4", st.Spare)
+	}
+
+	// SkipLatency=true 路径不产生 latency 条目（也不 panic）。
+	rr2, _ := control.Send(sock, control.Req{Cmd: control.CmdRefreshRules, SkipLatency: true})
+	for _, e := range rr2.Resets {
+		if e.What == "latency" {
+			t.Errorf("SkipLatency 不应产生 latency 条目：%+v", e)
+		}
+	}
+}

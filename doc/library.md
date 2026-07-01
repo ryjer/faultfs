@@ -93,30 +93,40 @@ inj.Add(faultfs.Rule{
 
 ## 6. 可修复坏扇区（`HealOnWrite`，有状态）
 
-真实硬盘语义：读坏扇区→EIO；写该区→备用扇区重映射→write 成功、后续 read 正常；备用预算耗尽
+真实硬盘语义：读坏扇区→EIO；写该区→备用块重映射→write 成功、后续 read 正常；备用预算耗尽
 →write 也 EIO。把一条 read 规则的 `HealOnWrite` 置 true 即启用。规则持久保留，带运行时状态
 `healed`。
+
+备用块用「**块数量 + 块大小**」表达，治愈一段坏区时按 `ceil(坏区长度 / 块大小)` **整块消耗**。
+**默认 spare=0**（无备用），需显式分配预算。
 
 ```go
 inj.Add(faultfs.Rule{
 	Op: faultfs.OpRead, Path: "blob.bin", Off: 4096, OffLen: 4096,
 	Errno: syscall.EIO, HealOnWrite: true,
 })
-inj.SetSpare(4) // 备用扇区预算；-1=无限（默认）
-// 被测系统：读 [4096,8192) → EIO；重写该区 → 治愈；再读 → 正常。
+inj.SetSpareBlocks(8, 4096) // 8 个 4KiB 块（SetSpare(n) = blockSize=1 的便捷形式；-1=无限）
+// 被测系统：读 [4096,8192) → EIO；重写该区 → 治愈（消耗 ceil(4096/4096)=1 块）；再读 → 正常。
 // 正是 FSS raif inlineRepair（读 EIO → 重构 → 写回触发重映射）所依赖的语义。
 ```
 
 ## 7. 重放：`Refresh` 还原到初始态
 
-`Refresh` 把所有规则状态还原到 `Add` 时的初始态：`healed=false`、`remaining=初始 N`、
-`spare=SetSpare 设定的初始值`。规则配置不变。用于"治愈→刷新→再次故障"反复重放同一组场景。
+`Refresh(opts)` 把所有规则状态还原到 `Add` 时的初始态（`healed=false`、`remaining=初始 N`）、
+spare 还原到最近一次 set 的初始值；默认同时复位 profile/speed（`SkipLatency:true` 跳过——
+latency 不被消耗，复位通常 no-op）。规则配置不变。返回 `RefreshResult{Entries []ResetEntry}`：
+**仅记录实际变动的条目**（规则按 ID、spare、latency，各带 `Before`/`After`），便于显式日志、
+不留静默编号。用于"治愈→刷新→再次故障"反复重放同一组场景。
 
 ```go
 inj.Add(faultfs.Rule{Op: faultfs.OpRead, Path: "blob.bin", Errno: syscall.EIO, HealOnWrite: true})
-inj.SetSpare(4)
-// ... 跑一轮，治愈消耗了 1 格 spare ...
-inj.Refresh() // healed 全部复位，spare 回到 4；下一轮可再次故障
+inj.SetSpareBlocks(4, 4096)
+// ... 跑一轮，治愈消耗了 1 块 spare ...
+res := inj.Refresh(faultfs.RefreshOptions{}) // healed 复位，spare 回到 4*4KiB
+for _, e := range res.Entries {
+	log.Printf("reset %s: %s -> %s", e.What, e.Before, e.After) // 如 "rule 1: healed=true rem=-1 -> ..."
+}
+inj.Refresh(faultfs.RefreshOptions{SkipLatency: true}) // 跳过性能参数复位
 ```
 
 ## 8. 设备性能模拟
@@ -161,8 +171,8 @@ if len(warns) > 0 {
 | `Delete(id int) bool` | 按 ID 删除 |
 | `Clear()` / `Reset()` | 清空所有规则 |
 | `List() []RuleView` | 规则视图快照（含 `Healed`/`Remaining`） |
-| `Refresh()` | 重置所有规则到初始态（含 spare） |
-| `SetSpare(n int64)` / `Spare() int64` | 备用扇区预算（`-1` 无限） |
+| `Refresh(opts RefreshOptions) RefreshResult` | 重置规则/spare/（默认）性能参数到初始态；返回变动条目 `[]ResetEntry` |
+| `SetSpare(n)` / `SetSpareBlocks(count, blockSize)` / `Spare()` / `SpareBlockSize()` | 备用块预算（默认 `0`；`-1` 无限） |
 | `SetProfile` / `Profile` | 延迟模型 |
 | `SetSpeed` / `Speed` | 全局倍速 |
 | `Calibrate(dir)` / `AdjustProfile` / `CalibratedFloor()` / `SetProfileCalibrated` | backing 校准与钳制 |

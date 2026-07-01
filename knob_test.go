@@ -306,3 +306,67 @@ func TestSetLatencyValidation(t *testing.T) {
 		t.Fatalf("仅 --rand 应成功（触发 backing 校准+钳制）：%v", err)
 	}
 }
+
+// TestParseSpareSpec:备用块规格解析（count*size 与纯 count），含单位、负值、边界与非法。
+func TestParseSpareSpec(t *testing.T) {
+	cases := []struct {
+		in        string
+		count     int64
+		blockSize int64
+	}{
+		{"8*4KiB", 8, 4096},
+		{"8*4096", 8, 4096},
+		{"8*4K", 8, 4096},
+		{"16*1MiB", 16, 1 << 20},
+		{"8", 8, 1},   // 纯数量 → 块大小默认 1（兼容旧语义）
+		{"0", 0, 1},   // 默认 0
+		{"-1", -1, 1}, // 无限
+		{"-1*4KiB", -1, 4096},
+		{"1*1", 1, 1},
+	}
+	for _, c := range cases {
+		count, bs, err := ParseSpareSpec(c.in)
+		if err != nil {
+			t.Errorf("ParseSpareSpec(%q) err=%v", c.in, err)
+			continue
+		}
+		if count != c.count || bs != c.blockSize {
+			t.Errorf("ParseSpareSpec(%q) = (%d,%d), want (%d,%d)", c.in, count, bs, c.count, c.blockSize)
+		}
+	}
+	for _, bad := range []string{"", "abc", "8*", "*4KiB", "8*0", "8*-1", "8*abc", "--1", "8*0.5", "8*1.5"} {
+		if _, _, err := ParseSpareSpec(bad); err == nil {
+			t.Errorf("ParseSpareSpec(%q) 期望失败，却成功", bad)
+		}
+	}
+	if _, _, err := ParseSpareSpec("8*0"); err == nil {
+		t.Fatal("ParseSpareSpec(\"8*0\") 期望失败")
+	} else if _, ok := err.(*knobParseError); !ok {
+		t.Errorf("ParseSpareSpec 非法应返回 *knobParseError，得 %T", err)
+	}
+}
+
+// TestFormatSpareSize:FormatSpare / FormatSize 展示。
+func TestFormatSpareSize(t *testing.T) {
+	if s := FormatSize(4096); s != "4KiB" {
+		t.Errorf("FormatSize(4096)=%q want 4KiB", s)
+	}
+	if s := FormatSize(1 << 20); s != "1MiB" {
+		t.Errorf("FormatSize(1MiB)=%q want 1MiB", s)
+	}
+	if s := FormatSize(512); s != "512B" {
+		t.Errorf("FormatSize(512)=%q want 512B", s)
+	}
+	if s := FormatSpare(-1, 1); s != "unlimited" {
+		t.Errorf("FormatSpare(-1,1)=%q want unlimited", s)
+	}
+	if s := FormatSpare(8, 4096); s != "8*4KiB" {
+		t.Errorf("FormatSpare(8,4096)=%q want 8*4KiB", s)
+	}
+	if s := FormatSpare(0, 1); s != "0" {
+		t.Errorf("FormatSpare(0,1)=%q want 0", s)
+	}
+	if s := FormatSpare(4, 1); s != "4" {
+		t.Errorf("FormatSpare(4,1)=%q want 4", s)
+	}
+}

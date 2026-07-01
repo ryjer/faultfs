@@ -345,7 +345,7 @@ func handleControl(inj *Injector, meta mountMeta, req control.Req) control.Resp 
 		return control.Resp{OK: true, ID: inj.Add(r)}
 	case control.CmdDeleteRule:
 		if !inj.Delete(req.ID) {
-			return control.Resp{OK: false, Err: fmt.Sprintf("规则 id %d 不存在", req.ID)}
+			return control.Resp{OK: false, Err: fmt.Sprintf("rule id %d does not exist", req.ID)}
 		}
 		return control.Resp{OK: true}
 	case control.CmdClear:
@@ -354,8 +354,8 @@ func handleControl(inj *Injector, meta mountMeta, req control.Req) control.Resp 
 	case control.CmdListRules:
 		return control.Resp{OK: true, Rules: toControlViews(inj.List())}
 	case control.CmdRefreshRules:
-		inj.Refresh()
-		return control.Resp{OK: true}
+		res := inj.Refresh(RefreshOptions{SkipLatency: req.SkipLatency})
+		return control.Resp{OK: true, Resets: toResetViews(res.Entries)}
 	case control.CmdSetLatency:
 		warns, err := setLatency(inj, meta.backing, req)
 		if err != nil {
@@ -366,10 +366,14 @@ func handleControl(inj *Injector, meta mountMeta, req control.Req) control.Resp 
 		if !req.HasSpare {
 			return control.Resp{OK: false, Err: "no spare value specified"}
 		}
-		inj.SetSpare(req.Spare)
+		bs := req.SpareBlockSize
+		if bs < 1 {
+			bs = 1
+		}
+		inj.SetSpareBlocks(req.Spare, bs)
 		return control.Resp{OK: true}
 	case control.CmdStatus:
-		return control.Resp{OK: true, Rules: toControlViews(inj.List()), Profile: profileName(inj.Profile()), Spare: inj.Spare(), Speed: inj.Speed()}
+		return control.Resp{OK: true, Rules: toControlViews(inj.List()), Profile: profileName(inj.Profile()), Spare: inj.Spare(), SpareBlockSize: inj.SpareBlockSize(), Speed: inj.Speed()}
 	case control.CmdDump:
 		return control.Resp{OK: true, Dump: buildDump(inj, meta)}
 	}
@@ -425,8 +429,12 @@ func setLatency(inj *Injector, backing string, req control.Req) ([]string, error
 		warns = append(warns, inj.SetProfileCalibrated(backing, target)...)
 	}
 
-	// 全局倍速（可与 profile 或旋钮并存）。
+	// 全局倍速（可与 profile 或旋钮并存）。<=0 会被 SetSpeed 钳制为 1.0；这里明示告警，
+	// 避免用户想"清零/暂停延迟"却静默得到正常速度（spec/latency.md 注明的既定钳制行为）。
 	if req.HasSpeed {
+		if req.Speed <= 0 {
+			warns = append(warns, fmt.Sprintf("speed %s <= 0 is invalid, treating as 1.0 (normal); use a small positive value to slow down", trimFloat(req.Speed)))
+		}
 		inj.SetSpeed(req.Speed)
 	}
 	return warns, nil
@@ -439,15 +447,16 @@ func errf(format string, args ...any) error { return fmt.Errorf(format, args...)
 func buildDump(inj *Injector, meta mountMeta) *control.DumpView {
 	p := inj.Profile()
 	return &control.DumpView{
-		Rules:         toControlViews(inj.List()),
-		MountPID:      meta.pid,
-		Backing:       meta.backing,
-		Socket:        meta.socket,
-		MountTime:     meta.mountTime,
-		ProfileName:   profileName(p),
-		Speed:         inj.Speed(),
-		Spare:         inj.Spare(),
-		ProfileFields: profileFields(p),
+		Rules:          toControlViews(inj.List()),
+		MountPID:       meta.pid,
+		Backing:        meta.backing,
+		Socket:         meta.socket,
+		MountTime:      meta.mountTime,
+		ProfileName:    profileName(p),
+		Speed:          inj.Speed(),
+		Spare:          inj.Spare(),
+		SpareBlockSize: inj.SpareBlockSize(),
+		ProfileFields:  profileFields(p),
 	}
 }
 
@@ -467,6 +476,15 @@ func toControlViews(vs []RuleView) []control.RuleView {
 			Healed:      v.Healed,
 			Remaining:   v.Remaining,
 		}
+	}
+	return out
+}
+
+// toResetViews 把 faultfs.ResetEntry 列表转成 control 协议的 ResetView。
+func toResetViews(es []ResetEntry) []control.ResetView {
+	out := make([]control.ResetView, len(es))
+	for i, e := range es {
+		out[i] = control.ResetView{What: e.What, ID: e.ID, Before: e.Before, After: e.After}
 	}
 	return out
 }

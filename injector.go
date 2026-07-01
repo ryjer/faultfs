@@ -1,6 +1,7 @@
 package faultfs
 
 import (
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -57,11 +58,11 @@ type Rule struct {
 	N int
 
 	// HealOnWrite 把这条 read 规则变成“可修复的坏扇区”模型：read 命中（未
-	// 修复时）返回 Errno（如 EIO）；write 命中同区域则触发备用扇区重映射、
+	// 修复时）返回 Errno（如 EIO）；write 命中同区域则触发备用块重映射、
 	// 标记该规则为已修复——之后的 read 不再注入、读到重映射后的数据。备用
-	// 预算（Injector.spare）耗尽时 write 也返回 Errno。仅对 Op==OpRead 的规则
-	// 有意义；规则持久保留（healed 是运行时状态），可用 Refresh 重置。参见
-	// [Injector.Refresh]。
+	// 块预算（Injector.spareCount/spareBlockSize）耗尽时 write 也返回 Errno。
+	// 仅对 Op==OpRead 的规则有意义；规则持久保留（healed 是运行时状态），
+	// 可用 Refresh 重置。参见 [Injector.Refresh]。
 	HealOnWrite bool
 
 	// ID 由 Add 自动分配（从 1 递增），供 Delete/控制协议引用；0=未分配。
@@ -86,13 +87,21 @@ type RuleView struct {
 // Injector 是线程安全的故障注入规则集 + 设备性能模型。多个 FUSE 回调与
 // control server 可并发查询/修改它。
 type Injector struct {
-	mu           sync.Mutex
-	rules        []ruleState
-	nextID       int
-	spare        int64 // 当前备用扇区预算；-1 无限
-	initialSpare int64 // 初始 spare（Refresh 还原用）
-	profile      LatencyProfile
-	speed        float64 // 倍率；<=0 视为 1
+	mu     sync.Mutex
+	rules  []ruleState
+	nextID int
+	// 备用块预算：spareCount 个 spareBlockSize 字节的块。spareCount=-1 无限，默认 0
+	// （无备用，需显式 SetSpare/SetSpareBlocks 分配）。治愈一段坏区时按
+	// ceil(坏区长度/spareBlockSize) 整块消耗。initial* 为 Refresh 还原用的初始快照
+	// （由各 setter 同步更新，故 Refresh 复位到最近一次 set 的值）。
+	spareCount            int64
+	spareBlockSize        int64
+	initialSpareCount     int64
+	initialSpareBlockSize int64
+	profile               LatencyProfile
+	initialProfile        LatencyProfile // 初始 profile（Refresh 还原用）
+	speed                 float64        // 倍率；<=0 视为 1
+	initialSpeed          float64        // 初始 speed（Refresh 还原用）
 
 	// backing（通常 tmpfs）实测性能上限，缓存以便重复 set-latency 复用。calibOnce
 	// 保证首次校准独占执行（并发请求阻塞等待，不重跑 Calibrate）；calibDone 标记是否
@@ -105,8 +114,18 @@ type Injector struct {
 	calibOnce sync.Once
 }
 
-// NewInjector 建一个空规则集：spare 无限、speed 1.0、ProfileNone。
-func NewInjector() *Injector { return &Injector{spare: -1, initialSpare: -1, speed: 1} }
+// NewInjector 建一个空规则集：spare=0（无备用，需显式分配）、blockSize=1、speed 1.0、
+// ProfileNone（不模拟延迟，直透 backing）。
+func NewInjector() *Injector {
+	return &Injector{
+		spareCount:            0,
+		spareBlockSize:        1,
+		initialSpareCount:     0,
+		initialSpareBlockSize: 1,
+		speed:                 1,
+		initialSpeed:          1,
+	}
+}
 
 // Add 追加一条规则并返回分配的 ID。
 func (in *Injector) Add(r Rule) int {
@@ -156,31 +175,117 @@ func (in *Injector) List() []RuleView {
 	return out
 }
 
-// Refresh 把所有规则状态还原到 Add 时的初始态：healed=false、remaining=
-// 初始 N、spare=初始值。规则配置不变。用于反复重放同一组故障。
-func (in *Injector) Refresh() {
+// RefreshOptions 控制 [Injector.Refresh] 的复位范围。零值（SkipLatency=false）= 完整复位
+// （规则状态 + spare + 性能参数）。设 SkipLatency=true 则保留当前 profile/speed 不动。
+type RefreshOptions struct {
+	SkipLatency bool // 跳过性能参数（profile/speed）的复位
+}
+
+// ResetEntry 描述 Refresh 过程中发生的一次复位/变动，供调用方（如 CLI）日志告知。What 取
+// "rule"（含规则 ID）/ "spare" / "latency"；Before/After 为人类可读的变动前后状态。仅记录
+// 实际发生变化的条目（未变的规则/字段不产生 entry），避免静默聚合编号。
+type ResetEntry struct {
+	What   string // "rule" | "spare" | "latency"
+	ID     int    // 规则 ID（仅 What=="rule"）
+	Before string
+	After  string
+}
+
+// RefreshResult 汇总一次 Refresh 的全部变动条目。
+type RefreshResult struct {
+	Entries []ResetEntry
+}
+
+// Refresh 把所有规则状态还原到 Add 时的初始态（healed=false、remaining=初始 N）、spare
+// 还原到最近一次 set 的初始值；默认同时把 profile/speed 复位到初始值（opts.SkipLatency=true
+// 时跳过）。返回所有发生变动的条目列表（规则按 ID、spare、latency），供调用方显式日志，
+// 不留静默聚合编号。规则配置不变。用于反复重放同一组故障（治愈→刷新→再次故障）。
+func (in *Injector) Refresh(opts RefreshOptions) RefreshResult {
 	in.mu.Lock()
 	defer in.mu.Unlock()
+	var entries []ResetEntry
 	for i := range in.rules {
-		in.rules[i].remaining = in.rules[i].initialRem
-		in.rules[i].healed = false
+		s := &in.rules[i]
+		before := ruleStateText(s.healed, s.remaining)
+		s.remaining = s.initialRem
+		s.healed = false
+		if after := ruleStateText(s.healed, s.remaining); before != after {
+			entries = append(entries, ResetEntry{What: "rule", ID: s.r.ID, Before: before, After: after})
+		}
 	}
-	in.spare = in.initialSpare
+	// spare 复位到初始块预算（count + blockSize）。
+	sBefore := FormatSpare(in.spareCount, in.spareBlockSize)
+	if in.spareCount != in.initialSpareCount || in.spareBlockSize != in.initialSpareBlockSize {
+		in.spareCount = in.initialSpareCount
+		in.spareBlockSize = in.initialSpareBlockSize
+		if after := FormatSpare(in.spareCount, in.spareBlockSize); after != sBefore {
+			entries = append(entries, ResetEntry{What: "spare", Before: sBefore, After: after})
+		}
+	}
+	// 性能参数复位（默认；--keep-latency 跳过）。latency 无消耗路径，current 通常已等于
+	// initial，故这里多为 no-op；保留复位以兑现"重置回初始值"语义并提供显式安全开关。
+	if !opts.SkipLatency {
+		lBefore := latencyStateText(in.profile, in.speed)
+		in.profile = in.initialProfile
+		in.speed = in.initialSpeed
+		if after := latencyStateText(in.profile, in.speed); after != lBefore {
+			entries = append(entries, ResetEntry{What: "latency", Before: lBefore, After: after})
+		}
+	}
+	return RefreshResult{Entries: entries}
 }
 
-// SetSpare 设备用扇区预算（-1 无限）；同步更新初始快照，故 Refresh 会还原到该值。
-func (in *Injector) SetSpare(n int64) {
+// ruleStateText 把规则运行时状态格式化为紧凑串（healed=%v rem=%d）。
+func ruleStateText(healed bool, remaining int) string {
+	return "healed=" + strconv.FormatBool(healed) + " rem=" + strconv.Itoa(remaining)
+}
+
+// latencyStateText 把 profile/speed 格式化为紧凑串（profile=<name> speed=<v>）。
+func latencyStateText(p LatencyProfile, speed float64) string {
+	return "profile=" + profileName(p) + " speed=" + trimFloat(speed)
+}
+
+// SetSpare 设备用预算为 n 个默认块（blockSize=1，即每治愈消耗 1 块，等价于旧的纯次数语义）；
+// 同步更新初始快照，故 Refresh 会还原到该值。需要按真实块大小计费时用 [Injector.SetSpareBlocks]。
+func (in *Injector) SetSpare(n int64) { in.SetSpareBlocks(n, 1) }
+
+// SetSpareBlocks 设备用块预算：count 个 blockSize 字节的块（count=-1 无限；blockSize<1 钳到 1）。
+// 同步更新初始快照，故 Refresh 会还原到该值。治愈一段坏区时按 ceil(坏区长度/blockSize) 整块
+// 消耗（见 [blocksNeeded]）。
+func (in *Injector) SetSpareBlocks(count, blockSize int64) {
+	if blockSize < 1 {
+		blockSize = 1
+	}
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	in.spare = n
-	in.initialSpare = n
+	in.spareCount = count
+	in.spareBlockSize = blockSize
+	in.initialSpareCount = count
+	in.initialSpareBlockSize = blockSize
 }
 
-// Spare 返回当前剩余备用扇区预算（-1 无限）。
+// Spare 返回剩余备用块数（-1 无限）。块大小另见 [Injector.SpareBlockSize]。
 func (in *Injector) Spare() int64 {
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	return in.spare
+	return in.spareCount
+}
+
+// SpareBlockSize 返回每块字节数（默认 1；>1 表示按真实块大小整块计费）。
+func (in *Injector) SpareBlockSize() int64 {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	return in.spareBlockSize
+}
+
+// blocksNeeded 计算治愈一段长 offLen 字节的坏区需要消耗多少个 blockSize 字节的备用块：
+// blockSize<=1（纯次数模式）或 offLen<=0（未限定区间）时算 1 块；否则向上取整
+// （ceil(offLen/blockSize)）。真实硬盘语义：备用块按整块重映射。
+func blocksNeeded(offLen, blockSize int64) int64 {
+	if blockSize <= 1 || offLen <= 0 {
+		return 1
+	}
+	return (offLen + blockSize - 1) / blockSize
 }
 
 // Check 返回命中的 errno（0 表示放行，不注入）。op 是操作类型（取 Op* 常量），
@@ -227,12 +332,13 @@ func (in *Injector) Check(op, path string, off int64) syscall.Errno {
 				if s.healed {
 					continue // 已修复：放行 write
 				}
-				if in.spare == 0 {
-					return r.Errno // 备用耗尽：write 也 EIO
+				need := blocksNeeded(r.OffLen, in.spareBlockSize)
+				if in.spareCount != -1 && in.spareCount < need {
+					return r.Errno // 备用块不足：write 也 EIO
 				}
-				s.healed = true // 备用扇区重映射，治愈
-				if in.spare > 0 {
-					in.spare--
+				s.healed = true // 备用块重映射，治愈
+				if in.spareCount > 0 {
+					in.spareCount -= need // 整块消耗（-1 无限时不计）
 				}
 				return 0 // 放行 write
 			}
