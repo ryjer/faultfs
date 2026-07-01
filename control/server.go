@@ -46,6 +46,9 @@ func (s *Server) Listen() error {
 // Serve 接受连接直到 [Server.Close]。每条连接：读一个 JSON Req → handler → 写
 // 一个 JSON Resp，随后关闭连接（一请求一连接的简单协议，CLI 友好）。
 func (s *Server) Serve() {
+	if s.ln == nil {
+		return
+	}
 	for {
 		c, err := s.ln.Accept()
 		if err != nil {
@@ -59,6 +62,7 @@ func (s *Server) handle(c net.Conn) {
 	defer c.Close()
 	var req Req
 	if err := json.NewDecoder(bufio.NewReader(c)).Decode(&req); err != nil {
+		_ = json.NewEncoder(c).Encode(Resp{OK: false, Err: "bad request: " + err.Error()})
 		return
 	}
 	resp := s.handler(req)

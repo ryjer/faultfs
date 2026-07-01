@@ -169,9 +169,7 @@ func TestPathFilter(t *testing.T) {
 	writeFile(t, mp, "b.bin", bytes.Repeat([]byte("b"), 4096))
 	inj.Add(Rule{Op: OpRead, Path: "a.bin", Errno: syscall.EIO})
 
-	if _, err := os.OpenFile(filepath.Join(mp, "a.bin"), os.O_RDONLY, 0); err == nil {
-		// open is fine (rule is read-only); the read below must EIO.
-	}
+	// Verify open is fine (rule is read-only); the read below must EIO.
 	fa, err := os.Open(filepath.Join(mp, "a.bin"))
 	if err != nil {
 		t.Fatalf("open a: %v", err)

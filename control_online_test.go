@@ -48,7 +48,10 @@ func TestControlOnline_AddAndInject(t *testing.T) {
 		t.Fatalf("clear: %v", err)
 	}
 	// 重新 open 一个 fd（FOPEN_DIRECT_IO 保证不复用缓存）以观察 clear 后行为。
-	f2, _ := os.Open(p)
+	f2, err := os.Open(p)
+	if err != nil {
+		t.Fatalf("open after clear: %v", err)
+	}
 	defer f2.Close()
 	if _, err := f2.ReadAt(make([]byte, 4), 0); err != nil {
 		t.Fatalf("read after clear = %v, want nil", err)

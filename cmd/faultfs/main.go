@@ -58,7 +58,11 @@ func newMountCmd() *cobra.Command {
 
 // detachSelf 重新以非 detach 模式 fork 自身，新会话脱离终端，父进程立即返回。
 func detachSelf(backing, mp string) error {
-	c := exec.Command(os.Args[0], "mount", backing, mp)
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("detach: cannot find executable: %w", err)
+	}
+	c := exec.Command(exe, "mount", backing, mp)
 	c.Stdin = nil
 	c.Stdout = nil
 	c.Stderr = nil
@@ -110,9 +114,13 @@ func newAddCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use: "add <mp>", Short: "添加一条注入规则，打印分配的 ID", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			errnoVal, err := parseErrno(errnoStr)
+			if err != nil {
+				return err
+			}
 			req := control.Req{
 				Cmd: control.CmdAddRule, Op: op, Path: path, Off: off, OffLen: offLen,
-				Errno: int(parseErrno(errnoStr)), N: n, HealOnWrite: heal,
+				Errno: int(errnoVal), N: n, HealOnWrite: heal,
 			}
 			resp, err := sendCtl(args[0], req)
 			if err != nil {
@@ -173,6 +181,9 @@ func newListCmd() *cobra.Command {
 			resp, err := sendCtl(args[0], control.Req{Cmd: control.CmdListRules})
 			if err != nil {
 				return err
+			}
+			if len(resp.Rules) == 0 {
+				fmt.Println("(no rules)")
 			}
 			for _, r := range resp.Rules {
 				fmt.Printf("id=%d op=%s path=%q off=%d off-len=%d errno=%d n=%d heal=%v healed=%v rem=%d\n",
@@ -249,36 +260,42 @@ func newBadsectorCmd() *cobra.Command {
 	return c
 }
 
-// parseErrno 把 errno 名（EIO/ENOSPC/...）或数字字符串转 syscall.Errno。
-func parseErrno(s string) syscall.Errno {
-	if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil {
-		return syscall.Errno(n)
+// errnoNames 是 syscall.Errno → 名称的映射，可作为 parseErrno 和 errnoName 的
+// 单一真实来源。添加新 errno 时只需更新此 map。
+var errnoNames = map[syscall.Errno]string{
+	syscall.EIO:     "EIO",
+	syscall.ENOSPC:  "ENOSPC",
+	syscall.EROFS:   "EROFS",
+	syscall.ESTALE:  "ESTALE",
+	syscall.ENODEV:  "ENODEV",
+	syscall.EUCLEAN: "EUCLEAN",
+	syscall.EACCES:  "EACCES",
+	syscall.EPERM:   "EPERM",
+	syscall.ENOSYS:  "ENOSYS",
+	syscall.EFBIG:   "EFBIG",
+	syscall.EDQUOT:  "EDQUOT",
+}
+
+// nameToErrno 在 init 中由 errnoNames 自动构建。
+var nameToErrno map[string]syscall.Errno
+
+func init() {
+	nameToErrno = make(map[string]syscall.Errno, len(errnoNames))
+	for e, n := range errnoNames {
+		nameToErrno[n] = e
 	}
-	switch strings.ToUpper(strings.TrimSpace(s)) {
-	case "EIO":
-		return syscall.EIO
-	case "ENOSPC":
-		return syscall.ENOSPC
-	case "EROFS":
-		return syscall.EROFS
-	case "ESTALE":
-		return syscall.ESTALE
-	case "ENODEV":
-		return syscall.ENODEV
-	case "EUCLEAN":
-		return syscall.EUCLEAN
-	case "EACCES":
-		return syscall.EACCES
-	case "EPERM":
-		return syscall.EPERM
-	case "ENOSYS":
-		return syscall.ENOSYS
-	case "EFBIG":
-		return syscall.EFBIG
-	case "EDQUOT":
-		return syscall.EDQUOT
+}
+
+// parseErrno 把 errno 名（EIO/ENOSPC/...）或数字字符串转 syscall.Errno。无法解析时返回错误。
+func parseErrno(s string) (syscall.Errno, error) {
+	trimmed := strings.TrimSpace(s)
+	if n, err := strconv.Atoi(trimmed); err == nil {
+		return syscall.Errno(n), nil
 	}
-	return syscall.EIO
+	if e, ok := nameToErrno[strings.ToUpper(trimmed)]; ok {
+		return e, nil
+	}
+	return 0, fmt.Errorf("unknown errno: %q", s)
 }
 
 // ---- status / dump（只读快照）----
@@ -356,31 +373,10 @@ func writeJSON(v any) error {
 	return enc.Encode(v)
 }
 
-// errnoName 反查常见 errno 数字对应的名称；未知返回 "?"。
+// errnoName 反查常见 errno 数字对应的名称；未知返回 "?"。数据来源为 [errnoNames] map。
 func errnoName(n int) string {
-	switch syscall.Errno(n) {
-	case syscall.EIO:
-		return "EIO"
-	case syscall.ENOSPC:
-		return "ENOSPC"
-	case syscall.EROFS:
-		return "EROFS"
-	case syscall.ESTALE:
-		return "ESTALE"
-	case syscall.ENODEV:
-		return "ENODEV"
-	case syscall.EUCLEAN:
-		return "EUCLEAN"
-	case syscall.EACCES:
-		return "EACCES"
-	case syscall.EPERM:
-		return "EPERM"
-	case syscall.ENOSYS:
-		return "ENOSYS"
-	case syscall.EFBIG:
-		return "EFBIG"
-	case syscall.EDQUOT:
-		return "EDQUOT"
+	if name, ok := errnoNames[syscall.Errno(n)]; ok {
+		return name
 	}
 	return "?"
 }

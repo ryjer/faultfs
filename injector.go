@@ -19,10 +19,13 @@ const (
 	OpRename      = "rename"
 	OpGetattr     = "getattr"
 	OpStatfs      = "statfs"
+	OpSetattr     = "setattr"
 	OpGetxattr    = "getxattr"
 	OpSetxattr    = "setxattr"
 	OpRemovexattr = "removexattr"
 	OpListxattr   = "listxattr"
+	OpFsync       = "fsync"
+	OpFlush       = "flush"
 )
 
 // Rule 描述一条故障注入规则。一个 [Injector] 可同时持有任意多条 Rule，
@@ -124,8 +127,8 @@ func (in *Injector) Delete(id int) bool {
 // Clear 清空所有规则。
 func (in *Injector) Clear() {
 	in.mu.Lock()
+	defer in.mu.Unlock()
 	in.rules = nil
-	in.mu.Unlock()
 }
 
 // Reset 是 Clear 的别名（v1 兼容）。
