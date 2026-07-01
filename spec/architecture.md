@@ -92,9 +92,11 @@ faultfs 是一个 FUSE loopback 文件系统：把一个 backing 目录透传到
    └────────────────────────────────────────────┘
 ```
 
-`set-latency` 的特殊处理：首次调用触发 `Calibrate(backing)` 实测 backing 的随机寻址延迟 +
-顺序带宽并缓存，`AdjustProfile` 把目标参数里"比 backing 还快"的部分钳到 0 并在 `Resp.Warn`
-告警（"用更强的 tmpfs 模拟更弱的系统；预设值超出 tmpfs 时改用 tmpfs 模拟"）。
+`set-latency` 的特殊处理：首次调用（经 `Injector.SetProfileCalibrated`）触发 `Calibrate(backing)`
+实测 backing 的随机寻址延迟 + 顺序带宽并缓存（`sync.Once` 保证并发首调只跑一次），`AdjustProfile`
+把目标参数里"比 backing 还快"的部分钳到 0 并在 `Resp.Warns` 逐条告警（"用更强的 tmpfs 模拟更弱
+的系统；预设值超出 tmpfs 时改用 tmpfs 模拟"）。`--profile` 与 `--rand`/`--seq` 互斥，`--speed` 可与
+任一组合。
 
 ## 包布局与依赖方向
 

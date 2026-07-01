@@ -135,18 +135,22 @@ inj.SetProfile(faultfs.ProfileFromKnobs(8*time.Millisecond, 100*faultfs.MiB))
 ### 按 backing（tmpfs）上限钳制
 
 faultfs 通过叠加延迟模拟更慢设备，最快只能到 backing 本身（最强即 tmpfs）。库用户可手动校准
-并钳制：目标比 backing 还快的部分被钳到 0 并返回告警。
+并钳制：目标比 backing 还快的部分被钳到 0 并返回告警。`SetProfileCalibrated` 一步完成"校准 +
+钳制 + 写入"，与 CLI `set latency` 共用同一实现（策略只此一处）：
 
 ```go
-rand, bw, err := faultfs.Calibrate(backingDir)            // 实测 backing 随机延迟 + 顺序带宽
-if err == nil {
-	adj, warns := faultfs.AdjustProfile(target, rand, bw)  // 钳制 + 告警
-	inj.SetProfile(adj)
-	if len(warns) > 0 {
-		t.Logf("性能参数被钳制到 backing：%v", warns)
-	}
+warns := inj.SetProfileCalibrated(backingDir, target) // 一步：校准 + 钳制 + 写入
+if len(warns) > 0 {
+	t.Logf("性能参数被钳制到 backing：%v", warns)
 }
+// 等价的显式三步（想自行控制校准/钳制时）：
+// rand, bw, err := faultfs.Calibrate(backingDir)
+// if err == nil {
+//     adj, warns := faultfs.AdjustProfile(target, rand, bw)
+//     inj.SetProfile(adj)
+// }
 // 单位解析：faultfs.ParseLatency("8ms")、faultfs.ParseSpeed("100M")（字节/秒）
+// 取值校验：ParseLatency 拒绝负值；ParseSpeed 拒绝 NaN/Inf 与 <1 B/s（0=不限速）。
 ```
 
 ## 9. 在线管理 API 速查
@@ -161,7 +165,7 @@ if err == nil {
 | `SetSpare(n int64)` / `Spare() int64` | 备用扇区预算（`-1` 无限） |
 | `SetProfile` / `Profile` | 延迟模型 |
 | `SetSpeed` / `Speed` | 全局倍速 |
-| `Calibrate(dir)` / `AdjustProfile` / `CalibratedFloor()` | backing 校准与钳制 |
+| `Calibrate(dir)` / `AdjustProfile` / `CalibratedFloor()` / `SetProfileCalibrated` | backing 校准与钳制 |
 
 ## 10. 非 Go 进程也可驱动（control socket）
 

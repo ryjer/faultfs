@@ -23,7 +23,7 @@ faultfs 挂载守护进程在每个挂载点上启动一个 control server（uni
 | `clear` | 清空所有规则 |
 | `list-rules` | Resp 返回 `Rules []RuleView`（含 `healed`/`remaining`） |
 | `refresh-rules` | 重置所有规则到初始态 |
-| `set-latency` | 按 `Profile` 设档、按 `Speed`（`HasSpeed`）设倍速、按 `RandNs`/`SeqBw`（`HasRand`/`HasSeq`）设手动性能旋钮；按 backing 钳制后写入，`Warn` 携带钳制告警 |
+| `set-latency` | 按 `Profile` 设档、按 `Speed`（`HasSpeed`）设倍速、按 `RandNs`/`SeqBw`（`HasRand`/`HasSeq`）设手动性能旋钮（`--profile` 与 `--rand`/`--seq` 互斥）；按 backing 钳制后写入，`Warns []string` 携带钳制告警（逐条） |
 | `set-spare` | 按 `Spare`（`HasSpare` 时）设备用预算 |
 | `status` | 精简快照：Resp 返回 `Rules`/`Profile`/`Speed`/`Spare` |
 | `dump` | 全量快照：Resp 返回 `Dump *DumpView`（规则完整配置 + 挂载元信息 + 完整 profile 字段） |
@@ -37,7 +37,7 @@ faultfs 挂载守护进程在每个挂载点上启动一个 control server（uni
 
 ### Resp 字段
 
-`OK`、`Err`、`Warn`（非致命告警，如性能参数被钳制到 backing 上限）、`ID`、`Rules []RuleView`、
+`OK`、`Err`、`Warns []string`（非致命告警，如性能参数被钳制到 backing 上限；逐条输出）、`ID`、`Rules []RuleView`、
 `Profile`、`Speed`、`Spare`、`Dump *DumpView`（仅 `dump` 命令）。
 
 ### DumpView（dump 命令返回的全量快照）
@@ -61,7 +61,7 @@ faultfs 挂载守护进程在每个挂载点上启动一个 control server（uni
 | `list <mp>` | 列出规则与运行时状态 |
 | `status <mp> [--json]` | 精简概览（规则数/spare/speed/profile + 每规则一行） |
 | `dump <mp> [--json]` | 全量诊断快照（挂载元信息 + 完整规则 + 完整 profile 字段），适合日志沉淀 |
-| `set latency <mp> [--profile X] [--speed N] [--rand D] [--seq S]` | 设备档 / 倍速 / 手动性能旋钮（设备固有属性）；超出 backing(tmpfs) 上限时告警并钳制 |
+| `set latency <mp> [--profile X] [--speed N] [--rand D] [--seq S]` | 设备档 / 倍速 / 手动性能旋钮（设备固有属性）。`--profile` 与 `--rand`/`--seq` 互斥；`--rand` 不可为负，`--seq` 须 ≥1 B/s（`0`=不限速）；超出 backing(tmpfs) 上限时告警并钳制 |
 | `set spare <mp> <n>` | 备用扇区预算（`-1` 无限）；`refresh` 会还原到该初始值 |
 
 `--errno` 接受名称（`EIO`/`ENOSPC`/`EROFS`/`ESTALE`/`EUCLEAN`/`ENODEV`/`EACCES`/
