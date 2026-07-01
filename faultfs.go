@@ -331,9 +331,11 @@ func checkCapacityAtMount(backing string, capacity int64) error {
 	if err := syscall.Statfs(backing, &sf); err != nil {
 		return fmt.Errorf("capacity 校验：statfs %s: %w", backing, err)
 	}
-	bsize := int64(sf.Bsize)
-	used := (int64(sf.Blocks) - int64(sf.Bfree)) * bsize
-	total := int64(sf.Blocks) * bsize
+	// 用 f_frsize（基本块）换算，与 backingStatfsUsed/Total 同口径；含负值钳制（理论上
+	// Bfree<=Blocks，防御性）。mount 时 statfs 失败 fail-closed（拒绝挂载），与运行时
+	// checkWriteCapacity 的 fail-open（沿缓存放行）互补。
+	used := backingStatfsUsed(&sf)
+	total := backingStatfsTotal(&sf)
 	if capacity <= used {
 		return fmt.Errorf("capacity %s ≤ backing 已用 %s；挂载即满，无法模拟（capacity 须 > backing 已用）", FormatSize(capacity), FormatSize(used))
 	}
@@ -347,7 +349,9 @@ func checkCapacityAtMount(backing string, capacity int64) error {
 // backing真实used（used 从 out 已填的 backing 真实值推算）。让 df/上层 statfs 看到模拟容量，
 // 同时保留 backing 的块大小与真实已用量。供 [FaultNode.Statfs] 在设了 capacity 时调用。
 func reflectCapacity(out *fuse.StatfsOut, capacity int64) {
-	frsize := int64(out.Bsize)
+	// 用 f_frsize 换算（Blocks/Bfree 以 frsize 为单位）；go-fuse 在 Linux 从 backing
+	// statfs 忠实拷贝 Frsize。tmpfs/ext4 等通常 Bsize==Frsize，但二者不同的 fs 上只有 frsize 正确。
+	frsize := int64(out.Frsize)
 	if frsize <= 0 {
 		frsize = 1
 	}

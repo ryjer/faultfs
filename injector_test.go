@@ -1,6 +1,7 @@
 package faultfs
 
 import (
+	"math"
 	"strings"
 	"sync"
 	"syscall"
@@ -439,5 +440,106 @@ func TestHealOnWrite_HugeRegionFallsBackToWhole(t *testing.T) {
 	}
 	if got := inj.Spare(); got != 2 {
 		t.Fatalf("spare 被污染 = %d, want 2（未治愈不应消耗）", got)
+	}
+}
+
+// TestOffMatchOverlap:off 区间匹配按"请求区间 [off,off+length) 与坏区 [Off,Off+OffLen) 有交集"
+// 判定，而非只看请求起点 off。修旧实现只看起点，致"起点在坏区前但延伸进坏区"的覆盖写/读漏命中。
+func TestOffMatchOverlap(t *testing.T) {
+	inj := NewInjector()
+	inj.Add(Rule{Op: OpRead, Path: "f", Off: 4096, OffLen: 4096, Errno: syscall.EIO})
+	// read@0 len=8192：起点 0<4096，但 [0,8192) 覆盖 [4096,8192) → 应 EIO。
+	if e := inj.Check(OpRead, "f", 0, 8192); e != syscall.EIO {
+		t.Fatalf("read[0,8192) over [4096,8192) = %v, want EIO (overlap)", e)
+	}
+	// read@0 len=4096：[0,4096) 与 [4096,8192) 相邻不相交 → 放行。
+	if e := inj.Check(OpRead, "f", 0, 4096); e != 0 {
+		t.Fatalf("read[0,4096) = %v, want 0 (adjacent, no overlap)", e)
+	}
+	// read@8192：起点已在坏区后 → 放行。
+	if e := inj.Check(OpRead, "f", 8192, 4096); e != 0 {
+		t.Fatalf("read@8192 = %v, want 0 (past region)", e)
+	}
+}
+
+// TestHealOnWrite_OverlappingWriteHeals:起点在坏区前的覆盖写延伸进坏区时也触发治愈
+// （overlap 门 + coverRange 区间相交计算）。修旧 off-gate 只看起点致此类写漏治愈、后续 read 仍 EIO。
+func TestHealOnWrite_OverlappingWriteHeals(t *testing.T) {
+	inj := NewInjector()
+	inj.SetSpare(-1)
+	inj.Add(Rule{Op: OpRead, Path: "f", Off: 4096, OffLen: 4096, Errno: syscall.EIO, HealOnWrite: true})
+	if e := inj.Check(OpRead, "f", 4096, 4096); e != syscall.EIO {
+		t.Fatalf("read = %v, want EIO", e)
+	}
+	// write@0 len=8192（起点 0<4096，覆盖整个坏区）→ 应治愈。
+	if e := inj.Check(OpWrite, "f", 0, 8192); e != 0 {
+		t.Fatalf("overlap write = %v, want 0 (healed)", e)
+	}
+	if e := inj.Check(OpRead, "f", 4096, 4096); e != 0 {
+		t.Fatalf("read after heal = %v, want 0", e)
+	}
+}
+
+// TestHealOnWrite_OpEmptyNormalized:HealOnWrite 规则省略 Op（=""）时 Add 归一为 OpRead，
+// 不致静默退化为"永久 EIO、永不治愈"（旧实现空 Op 穿透到普通规则路径，write 也 EIO、永不治愈）。
+func TestHealOnWrite_OpEmptyNormalized(t *testing.T) {
+	inj := NewInjector()
+	inj.SetSpare(-1)
+	id := inj.Add(Rule{Path: "f", Errno: syscall.EIO, HealOnWrite: true}) // Op 省略
+	if inj.List()[id-1].Op != OpRead {
+		t.Fatalf("HealOnWrite 规则 Op 应归一为 OpRead，得 %q", inj.List()[id-1].Op)
+	}
+	if e := inj.Check(OpRead, "f", 0, 1); e != syscall.EIO {
+		t.Fatalf("read = %v, want EIO", e)
+	}
+	if e := inj.Check(OpWrite, "f", 0, 1); e != 0 {
+		t.Fatalf("write = %v, want 0 (healed)", e)
+	}
+	if e := inj.Check(OpRead, "f", 0, 1); e != 0 {
+		t.Fatalf("read after heal = %v, want 0", e)
+	}
+}
+
+// TestPerBlockChargeLiveBlockSize:Add 后 SetSpareBlocks 改 blockSize，按块治愈的扣费按 live
+// blockSize 换算（经字节数中转），与 spareCount 的实时口径一致。grid bs=4096 治愈 2 块=8192B，
+// live bs=8192 → 扣 1 块（非旧实现的 2 块——单位错配）。
+func TestPerBlockChargeLiveBlockSize(t *testing.T) {
+	inj := NewInjector()
+	inj.SetSpareBlocks(8, 4096) // 网格 bs=4096
+	inj.Add(Rule{Op: OpRead, Path: "f", Off: 0, OffLen: 8192, Errno: syscall.EIO, HealOnWrite: true})
+	inj.SetSpareBlocks(16, 8192) // live bs 改 8192；spareCount=16（=128KiB 预算）
+	// write 全区 → 治愈 2 个 4096 网格块（8192B）→ 换算到 8192-live 单位 = 1 块。spare 16→15。
+	if e := inj.Check(OpWrite, "f", 0, 8192); e != 0 {
+		t.Fatalf("heal = %v, want 0", e)
+	}
+	if got := inj.Spare(); got != 15 {
+		t.Fatalf("spare = %d, want 15（8192B 治愈 / 8192 live bs = 1 块；旧实现错配为 2）", got)
+	}
+}
+
+// TestCoverRangeOverflowSafe:off+length / rOff+rLen 接近 MaxInt64 时 addOK 钳到 MaxInt64，
+// 不回绕成负值致 hi<=lo 误判无交集（坏区 high-offset 写入漏治愈 / 读漏 EIO）。
+func TestCoverRangeOverflowSafe(t *testing.T) {
+	max := int64(math.MaxInt64)
+	// 坏区 [max-4096, max)，请求 off=max-512, length=4096（off+length 溢出）→ 仍判相交。
+	start, end, ok := coverRange(max-4096, 4096, max-512, 4096, 4096, 1)
+	if !ok || start != 0 || end != 0 {
+		t.Fatalf("coverRange(high-off overflow) = (%d,%d,%v), want (0,0,true)", start, end, ok)
+	}
+	// 不相交：请求远在坏区前。
+	if _, _, ok := coverRange(max-4096, 4096, 0, 4096, 4096, 1); ok {
+		t.Fatal("coverRange(0 vs high region) 应无交集")
+	}
+}
+
+// TestAddOK:addOK 在溢出时钳到 MaxInt64、负 b 视为 0。
+func TestAddOK(t *testing.T) {
+	max := int64(math.MaxInt64)
+	for _, c := range []struct{ a, b, want int64 }{
+		{0, 0, 0}, {10, 20, 30}, {max, 1, max}, {max - 5, 10, max}, {5, -3, 5},
+	} {
+		if got := addOK(c.a, c.b); got != c.want {
+			t.Errorf("addOK(%d,%d) = %d, want %d", c.a, c.b, got, c.want)
+		}
 	}
 }

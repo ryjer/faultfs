@@ -104,7 +104,7 @@ inj.SetSpeed(2.0)
 warns := inj.SetProfileCalibrated(backingDir, target) // 一步：校准 + 钳制 + 写入
 // 等价的显式三步（库用户想自行控制时）：
 // rand, bw, _ := faultfs.Calibrate(backingDir)
-// adj, warns := faultfs.AdjustProfile(target, rand, bw)
+// adj, warns := faultfs.AdjustProfile(target, bw) // rand 是叠加增量、不钳；仅钳 seq 带宽
 // inj.SetProfile(adj)
 ```
 ```sh

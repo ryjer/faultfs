@@ -126,7 +126,7 @@ func TestProfileFromKnobs(t *testing.T) {
 func TestAdjustProfileClamps(t *testing.T) {
 	// 新语义：rand 是叠加增量（不减 backing、不告警）；seq 是限制上限（目标带宽 > backing 时钳到 backing 并告警）。
 	target := ProfileFromKnobs(8*time.Millisecond, 100*MiB)
-	adj, warns := AdjustProfile(target, 1*time.Microsecond, 5*GiB)
+	adj, warns := AdjustProfile(target, 5*GiB)
 	if len(warns) != 0 {
 		t.Errorf("rand 增量 + seq 慢于 backing 不应告警，得 %v", warns)
 	}
@@ -146,7 +146,7 @@ func TestAdjustProfileClamps(t *testing.T) {
 	// seq 目标带宽 > backing（想限到的速度比 backing 还快）：rand 仍透传，seq 钳到 backing 并告警。
 	// 用 ≤1GiB/s 量级带宽（per-byte ≥1ns 可精确表达）；>1GiB/s 的 per-byte <1ns 会被量化为 0。
 	fast := ProfileFromKnobs(1*time.Nanosecond, 500*MiB) // rand=1ns 增量，seq=500MiB/s（快于 backing 100MiB/s）
-	adj2, warns2 := AdjustProfile(fast, 1*time.Microsecond, 100*MiB)
+	adj2, warns2 := AdjustProfile(fast, 100*MiB)
 	// rand 1ns 增量合法，透传不减、不告警。
 	if adj2.ReadRand != 1*time.Nanosecond {
 		t.Errorf("rand 增量应透传不减 backing：%v", adj2.ReadRand)
@@ -166,7 +166,7 @@ func TestAdjustProfileClamps(t *testing.T) {
 	}
 
 	// backing 未校准（measuredBw<=0）：seq 透传不钳；rand 透传。
-	adj3, warns3 := AdjustProfile(target, 1*time.Microsecond, 0)
+	adj3, warns3 := AdjustProfile(target, 0)
 	if len(warns3) != 0 || adj3.ReadRand != target.ReadRand {
 		t.Errorf("未校准应透传不钳：%v / %v", warns3, adj3.ReadRand)
 	}
@@ -272,7 +272,7 @@ func TestFormatSpeedFractional(t *testing.T) {
 // rand 是叠加增量，元数据 op 也透传不减 backing（不再"快于 backing 时钳到 0"）。
 func TestAdjustProfileClampsMetadata(t *testing.T) {
 	fast := ProfileFromKnobs(1*time.Nanosecond, 0) // rand=1ns 增量
-	adj, _ := AdjustProfile(fast, 1*time.Microsecond, 0)
+	adj, _ := AdjustProfile(fast, 0)
 	// rand 1ns 增量合法，元数据 op = 1ns（不减 backing，不钳到 0）。
 	for name, d := range map[string]time.Duration{
 		"Open": adj.Open, "Getattr": adj.Getattr, "Create": adj.Create, "Statfs": adj.Statfs,
@@ -283,7 +283,7 @@ func TestAdjustProfileClampsMetadata(t *testing.T) {
 	}
 
 	slow := ProfileFromKnobs(8*time.Millisecond, 0)
-	adj2, warns := AdjustProfile(slow, 1*time.Microsecond, 0)
+	adj2, warns := AdjustProfile(slow, 0)
 	if adj2.Open != 8*time.Millisecond {
 		t.Errorf("Open 应透传 8ms 增量（不减 backing）：%v", adj2.Open)
 	}

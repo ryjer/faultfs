@@ -158,7 +158,7 @@ if len(warns) > 0 {
 // 等价的显式三步（想自行控制校准/钳制时）：
 // rand, bw, err := faultfs.Calibrate(backingDir)
 // if err == nil {
-//     adj, warns := faultfs.AdjustProfile(target, rand, bw)
+//     adj, warns := faultfs.AdjustProfile(target, bw) // rand 是叠加增量、不钳；仅钳 seq 带宽
 //     inj.SetProfile(adj)
 // }
 // 单位解析：faultfs.ParseLatency("8ms")、faultfs.ParseSpeed("100M")（字节/秒）

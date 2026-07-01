@@ -15,6 +15,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"sort"
@@ -42,10 +43,20 @@ func main() {
 	// 置于根命令即全局静默 Usage（cobra ExecuteC 的 !c.SilenceUsage && !cmd.SilenceUsage
 	// 逻辑下，二者其一为真即不打印），仍保留 "Error: <msg>" 一行。
 	root.SilenceUsage = true
+	// --detach fork 出的子进程经 status pipe 把 setup 错误回报给父进程（见 detachSelf）；
+	// 此时静默子进程的 cobra "Error:" 打印，避免同一错误既走 pipe 又打到继承的 stderr 重复。
+	if os.Getenv(detachStatusFDEnv) != "" {
+		root.SilenceErrors = true
+	}
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
 	}
 }
+
+// detachStatusFDEnv 是父进程传给 --detach 子进程的环境变量，值为 status pipe 的 fd 号
+// （子进程经 ExtraFiles 继承为 fd 3）。子进程 setup 完成（就绪/失败）即向该 fd 写一字节
+// 状态，父进程据此立即返回——失败时拿到的就是真实 setup 错误，无需空等 5s socket 轮询。
+const detachStatusFDEnv = "FAULTFS_DETACH_STATUS_FD"
 
 // ---- mount / unmount ----
 
@@ -62,12 +73,39 @@ func newMountCmd() *cobra.Command {
 				// detach：把挂载参数透传给 fork 出的守护子进程，由其完成 setup。
 				return detachSelf(backing, mp, mountExtraArgs(cmd))
 			}
+			// 子进程路径：--detach fork 出来的子进程带着 FAULTFS_DETACH_STATUS_FD，setup 完成
+			// 后向该 fd 回报状态；前台进程无此 env，report 为 no-op，行为不变。
+			statusW := openStatusWriter(os.Getenv(detachStatusFDEnv))
+			report := func(ok bool, msg string) {
+				if statusW == nil {
+					return
+				}
+				if ok {
+					statusW.WriteString("1")
+				} else {
+					statusW.WriteString("0" + msg)
+				}
+				statusW.Close()
+			}
 			inj, warns, err := buildInjector(backing, randStr, seqStr, spareStr, capacityStr)
 			if err != nil {
+				report(false, err.Error()) // 参数/容量解析错误经 pipe 给父进程
 				return err
 			}
 			for _, w := range warns {
 				fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+			}
+			if statusW != nil {
+				// 子进程：Run 在 goroutine 里跑（成功则阻塞服务），与 control socket 就绪竞速，
+				// 任一先到即回报——setup 失败（如 capacity 校验拒绝）立即反馈，不等 socket 轮询超时。
+				errCh := make(chan error, 1)
+				go func() { errCh <- faultfs.Run(mp, backing, inj) }()
+				if rerr := waitReadyOrError(control.SocketPath(mp), errCh); rerr != nil {
+					report(false, rerr.Error())
+					return rerr
+				}
+				report(true, "")
+				return <-errCh // 阻塞至卸载信号；正常退出返 nil
 			}
 			return faultfs.Run(mp, backing, inj)
 		},
@@ -138,51 +176,84 @@ func buildInjector(backing, randStr, seqStr, spareStr, capacityStr string) (*fau
 	return inj, warns, nil
 }
 
-// detachSelf 重新以非 detach 模式 fork 自身，新会话脱离终端；父进程等待 control
-// socket 就绪后返回，从而 `mount --detach` 一返回即可接收 add/set 等子命令。
-// extraArgs 是透传给子进程的挂载参数（--rand/--seq/--spare），保证后台路径同样完成
-// setup（含按 backing 钳制）。子进程 stderr 继承父进程 stderr：setup（解析参数、
-// 校准、钳制）先于 control socket Listen，故启动期告警会先于 socket 就绪输出，
-// 父进程据此把 warning: 暴露给用户（子进程退出码同样反映失败）。
+// detachSelf 重新以非 detach 模式 fork 自身，新会话脱离终端；父进程通过 status pipe 等待
+// 子进程 setup 完成（就绪或失败）后返回，从而 `mount --detach` 一返回即可接收 add/set 等子命令，
+// 且 setup 失败（如 capacity 校验拒绝）时立即拿到真实错误而非空等 socket 轮询超时。
+// extraArgs 是透传给子进程的挂载参数（--rand/--seq/--spare/--capacity），保证后台路径同样
+// 完成 setup。子进程 stderr 继承父进程 stderr：启动期 warning: 由子进程直接打出。
 func detachSelf(backing, mp string, extraArgs []string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("detach: cannot find executable: %w", err)
+	}
+	// status pipe：子进程 setup 完成后写 "1"(就绪) 或 "0<msg>"(失败) 到 fd 3，父进程据此返回。
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("detach: status pipe: %w", err)
 	}
 	args := append([]string{"mount", backing, mp}, extraArgs...)
 	c := exec.Command(exe, args...)
 	c.Stdin = nil
 	c.Stdout = nil
 	c.Stderr = os.Stderr
+	c.ExtraFiles = []*os.File{pw} // 子进程作为 fd 3 继承（stdin/out/err 之后）
+	c.Env = append(os.Environ(), detachStatusFDEnv+"=3")
 	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := c.Start(); err != nil {
+		pr.Close()
+		pw.Close()
 		return fmt.Errorf("detach: %w", err)
 	}
 	pid := c.Process.Pid
+	pw.Close() // 父进程只读
+	data, _ := io.ReadAll(pr)
+	pr.Close()
 	sock := control.SocketPath(mp)
-	// 等待守护进程绑定 control socket（轮询一次 status round-trip）。就绪即返回；
-	// 超时通常意味着子进程已退出（如 /dev/fuse 不可用、backing 无效）——返回错误让
-	// mount 以非零退出，避免脚本误以为挂载成功、却在下一条命令（add/set…）上才失败。
-	if rerr := waitReady(sock, 5*time.Second); rerr != nil {
-		return fmt.Errorf("mount: control socket %s 未就绪（%v）；守护进程可能未成功挂载（请检查 /dev/fuse 与 backing）", sock, rerr)
+	if len(data) == 0 {
+		_ = c.Wait()
+		return fmt.Errorf("mount: 守护进程在报告状态前退出（请检查 /dev/fuse 与 backing）")
 	}
-	fmt.Fprintf(os.Stderr, "faultfs mounted at %s (pid %d, socket %s)\n", mp, pid, sock)
-	return nil
+	if data[0] == '1' {
+		fmt.Fprintf(os.Stderr, "faultfs mounted at %s (pid %d, socket %s)\n", mp, pid, sock)
+		return nil
+	}
+	// "0"+msg：子进程 setup 失败的真实错误（子进程已 SilenceErrors，仅经 pipe 回传）。
+	_ = c.Wait()
+	return fmt.Errorf("mount: %s", strings.TrimSpace(string(data[1:])))
 }
 
-// waitReady 反复向 socket 发一次 status 请求，直到成功 round-trip（守护进程已监听并
-// 服务）或超时。control socket 的 Listen 先于 Serve，故一次成功的响应即代表就绪。
-func waitReady(socket string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	var lastErr error
+// openStatusWriter 把 detachStatusFDEnv 指定的 fd 包装为 *os.File，供子进程写状态。
+// env 未设（前台 mount）返回 nil。
+func openStatusWriter(fdStr string) *os.File {
+	if fdStr == "" {
+		return nil
+	}
+	fd, err := strconv.Atoi(fdStr)
+	if err != nil {
+		return nil
+	}
+	return os.NewFile(uintptr(fd), "detach-status")
+}
+
+// waitReadyOrError 等待 control socket 就绪（成功）或 Run 返回 setup 错误（失败），任一先到即返回。
+// 替代纯轮询：setup 失败（如 capacity 校验拒绝、/dev/fuse 不可用）时 Run 立即返回 err，本函数
+// 下一轮 select 即捕获（≤20ms），不必空等 5s 超时。
+func waitReadyOrError(socket string, errCh <-chan error) error {
+	deadline := time.Now().Add(5 * time.Second)
 	for {
+		select {
+		case err := <-errCh:
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("守护进程在 control socket 就绪前退出")
+		default:
+		}
 		if _, err := control.Send(socket, control.Req{Cmd: control.CmdStatus}); err == nil {
 			return nil
-		} else {
-			lastErr = err
 		}
 		if time.Now().After(deadline) {
-			return lastErr
+			return fmt.Errorf("control socket %s 5s 内未就绪（守护进程可能未成功挂载；请检查 /dev/fuse 与 backing）", socket)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -599,14 +670,12 @@ func formatCapacity(cap int64) string {
 	return faultfs.FormatSize(cap)
 }
 
-// formatHealed 把规则的治愈状态格式化为展示串：非 HealOnWrite → "n/a"；按块模式 → "N/M"
-// （已治愈块数/总块数）；整段模式 → "true"/"false"。
+// formatHealed 把规则的治愈状态格式化为展示串：非 HealOnWrite → "n/a"；HealOnWrite → "N/M"
+// （已治愈块数/总块数）。按块模式 N=已治愈网格块、M=网格块总数；整段/回退模式 M=1（故显示
+// "0/1" 或 "1/1"）。List() 对所有 HealOnWrite 规则都填 TotalBlocks>=1，故无需 bool 兜底。
 func formatHealed(r control.RuleView) string {
 	if !r.HealOnWrite {
 		return "n/a"
 	}
-	if r.TotalBlocks > 0 {
-		return fmt.Sprintf("%d/%d", r.HealedBlocks, r.TotalBlocks)
-	}
-	return strconv.FormatBool(r.Healed)
+	return fmt.Sprintf("%d/%d", r.HealedBlocks, r.TotalBlocks)
 }

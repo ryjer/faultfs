@@ -2,6 +2,7 @@ package faultfs
 
 import (
 	"context"
+	"math"
 	"sync/atomic"
 	"syscall"
 
@@ -23,9 +24,10 @@ type FaultFile struct {
 }
 
 var (
-	_ fs.FileReader  = (*FaultFile)(nil)
-	_ fs.FileWriter  = (*FaultFile)(nil)
-	_ fs.FileFsyncer = (*FaultFile)(nil)
+	_ fs.FileReader    = (*FaultFile)(nil)
+	_ fs.FileWriter    = (*FaultFile)(nil)
+	_ fs.FileFsyncer   = (*FaultFile)(nil)
+	_ fs.FileAllocater = (*FaultFile)(nil)
 )
 
 // Read 命中 read 规则时返回 (nil, errno)；否则透传，并按”顺序/随机”+ 字节数
@@ -45,12 +47,14 @@ func (f *FaultFile) Read(ctx context.Context, buf []byte, off int64) (fuse.ReadR
 // 使用 n（实际写入字节数）而非 len(data) 以保证部分写入时顺序检测正确。
 func (f *FaultFile) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
 	f.inj.DelayWrite(off == f.lastWriteOff.Load(), len(data))
-	if e := f.inj.Check(OpWrite, f.path, off, int64(len(data))); e != 0 {
+	// 容量判定在规则 Check 之前：磁盘满是设备级硬限制，应先于规则副作用触发。若反过来
+	// （先 Check 后容量），HealOnWrite 治愈（扣 spare、标记 healed）会在随后容量返 ENOSPC
+	// 时已落盘却无法回滚——write 失败但坏块显示已治愈、后续 read 放行读到 backing 旧数据
+	// （heal-then-ENOSPC 原子性破坏）。详见 spec/capacity.md。
+	if e := f.inj.checkWriteCapacity(f.backing, int64(len(data))); e != 0 {
 		return 0, e
 	}
-	// 容量判定（设备级，独立于规则注入）：规则未命中才查。模拟磁盘满时强制 ENOSPC，
-	// 保证 faultfs 模拟的"满"先于 backing 真满触发。详见 spec/capacity.md。
-	if e := checkWriteCapacity(f.inj.Capacity(), f.backing, len(data)); e != 0 {
+	if e := f.inj.Check(OpWrite, f.path, off, int64(len(data))); e != 0 {
 		return 0, e
 	}
 	n, errno := f.LoopbackFile.Write(ctx, data, off)
@@ -64,25 +68,17 @@ func (f *FaultFile) Fsync(ctx context.Context, flags uint32) syscall.Errno {
 	return f.LoopbackFile.Fsync(ctx, flags)
 }
 
-// checkWriteCapacity 按模拟容量上限判定本次 write 是否放行：cap<=0（未启用）或 n<=0 →放行；
-// 实时 statfs(backing) 取真实已用，f_avail = cap - used，n > f_avail → ENOSPC（保守近似：
-// 覆盖写也按请求字节数计，仅在接近满时触发）。statfs 失败→放行（不因 statfs 故障误杀写入）。
-// 与 [Injector.Check] 的规则注入独立——规则（如 add --op write --errno ENOSPC）优先命中，
-// 未命中才查容量，两套 ENOSPC 来源不冲突。
-func checkWriteCapacity(cap int64, backing string, n int) syscall.Errno {
-	if cap <= 0 || n <= 0 {
-		return 0
+// Allocate 覆写 fallocate：在透传给 backing 前先做容量判定。fallocate 显式分配磁盘块
+// （与 truncate 的稀疏打洞不同），会真实增长 backing 已用，必须纳入容量模拟——否则
+// `fallocate -l 10M` 在 --capacity 1M 下仍成功，绕过"模拟满先于 backing 真满"的承诺。
+// size 为 uint64，饱和到 MaxInt64 再判定（超大 fallocate 直接 ENOSPC）。
+func (f *FaultFile) Allocate(ctx context.Context, off uint64, size uint64, mode uint32) syscall.Errno {
+	sz := int64(size)
+	if uint64(sz) != size { // size 超 int64 范围：必然超容量
+		sz = math.MaxInt64
 	}
-	var sf syscall.Statfs_t
-	if err := syscall.Statfs(backing, &sf); err != nil {
-		return 0
+	if e := f.inj.checkWriteCapacity(f.backing, sz); e != 0 {
+		return e
 	}
-	used := int64(sf.Blocks-sf.Bfree) * int64(sf.Bsize)
-	if used < 0 {
-		used = 0
-	}
-	if int64(n) > cap-used {
-		return syscall.ENOSPC
-	}
-	return 0
+	return f.LoopbackFile.Allocate(ctx, off, size, mode)
 }

@@ -10,12 +10,15 @@ faultfs 可在挂载时设一个**模拟容量上限** `capacity`，用于：
 | 量 | 含义 | 来源 |
 |---|---|---|
 | `capacity` | 模拟总容量（字节） | 用户设（`SetCapacity` / `mount --capacity`）；`0`=未启用 |
-| backing 已用 | backing 真实已用字节 | 实时 `statfs(backing)` 的 `(Blocks-Bfree)*Bsize` |
+| backing 已用 | backing 真实已用字节 | `statfs(backing)` 的 `(Blocks-Bfree)*Frsize`（带 ~10ms TTL 缓存） |
 | faultfs 可用 | `capacity - backing已用` | 推算 |
 
 关键不变量：**模拟的总量 = capacity，已用 = backing 真实已用**。capacity 不自己维护写入计数——
 直接读 backing 的 `statfs` 取真实已用，因此覆盖写、truncate、稀疏文件、甚至外部进程对 backing
-的写入都能被自动、正确地反映（无需 faultfs 维护文件大小表）。
+的写入都能被自动、正确地反映（无需 faultfs 维护文件大小表）。字节换算用 `f_frsize`（statfs 基本
+块），而非 `f_bsize`（优选传输块）——二者在 tmpfs/ext4 等通常相等，但不同的 fs 上只有 frsize 正确
+（block 计数字段以 frsize 为单位）。`statfs` 结果在 Injector 上有 ~10ms TTL 缓存，避免每个 write
+都打一次 statfs（高 IOPS 下 statfs 取 superblock 锁会成为热点）。
 
 挂载校验（`checkCapacityAtMount`）保证 capacity 落在合法区间，使 faultfs 先满：
 
@@ -31,14 +34,20 @@ backing已用 < capacity < backing总量
 
 ## 运行时行为
 
-- **write**：`FaultFile.Write` 在规则 `Check` 之后、透传之前调 `checkWriteCapacity`：若
-  `int64(n) > capacity - backing已用` 则返 `ENOSPC`（不写）。保守近似——覆盖写也按请求字节数 `n`
-  计，仅在接近满时触发；远离满时不会误杀。`statfs` 失败时放行（不因 statfs 故障误杀写入）。
+- **write / fallocate**：`FaultFile.Write` 与 `FaultFile.Allocate`（fallocate）在规则 `Check` **之前**
+  先调 `checkWriteCapacity`：若 `n > capacity - backing已用` 则返 `ENOSPC`（不写、也不进规则副作用）。
+  容量判定先于规则是为了避免 heal-then-ENOSPC：若先 `Check`（HealOnWrite 治愈会扣 spare、标记
+  healed）再判容量返 ENOSPC，write 失败却已落下治愈副作用、无法回滚，后续 read 会放行读到 backing
+  旧数据。保守近似——覆盖写也按请求字节数 `n` 计，仅在接近满时触发。`backing已用` 取 statfs 的
+  TTL 缓存；statfs 失败沿用上次缓存值（fail-open，不因 statfs 故障误杀写入；与挂载时 statfs 失败
+  拒绝挂载的 fail-closed 互补）。注：`ftruncate`/`O_TRUNC` 建稀疏文件不分配块、不增长已用，故不
+  在此判定之列（与真实稀疏文件语义一致）。
 - **statfs**：`FaultNode.Statfs` 先透传 backing 真实值，再若 `capacity>0` 用 `reflectCapacity` 改写
   `out.Blocks/Bfree/Bavail`：`total = capacity/frsize`、`avail = total - backing真实已用块`。`df` 与
   上层 `statfs` 据此看到模拟容量。
-- **优先级**：用户规则（如 `add --op write --errno ENOSPC`）优先命中；未命中才查容量。两套
-  `ENOSPC` 来源不冲突——规则是"针对 op/path 的注入"，容量是"设备级物理上限"。
+- **优先级**：容量是设备级硬上限，先于规则判定——磁盘满时任何 write/fallocate 直接 ENOSPC、不进
+  规则副作用。容量未满时才走规则 `Check`（规则如 `add --op write --errno ENOSPC` 可再注入）。两套
+  ENOSPC 来源分工明确：容量=设备物理上限，规则=针对 op/path 的注入。
 
 ## API / CLI
 

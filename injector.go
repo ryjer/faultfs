@@ -1,9 +1,11 @@
 package faultfs
 
 import (
+	"math"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -35,6 +37,23 @@ const (
 // write 整段治愈、按 blocksNeeded 整体扣 spare）——语义不丢，仅放弃逐块治愈粒度。
 // 1<<20 块 × 4KiB = 4GiB 坏区，远超实际坏扇区规模。
 const maxHealedBlocks = 1 << 20
+
+// usedCacheTTL 是 backing 已用字节数（statfs）缓存的有效期。容量判定在每个 Write 上触发，
+// 若每次都 statfs 会在高 IOPS 下成为热点（statfs 取 superblock 全局锁）。缓存把 statfs 频率
+// 限制到 ~100/秒；10ms 级陈旧对"磁盘满"这种粗粒度模拟可忽略。
+const usedCacheTTL = 10 * time.Millisecond
+
+// addOK 返回 a+b，溢出时钳到 MaxInt64（用于 off+length、rOff+rLen 等"非负端点求和"，
+// 防回绕成负值导致区间相交判定错乱）。a、b 预期为非负（offset/length/OffLen 均非负）。
+func addOK(a, b int64) int64 {
+	if b < 0 {
+		return a
+	}
+	if a < 0 || a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
+}
 
 // Rule 描述一条故障注入规则。一个 [Injector] 可同时持有任意多条 Rule，
 // 同一时刻多种错误可在不同文件/位置/op 上并存。Check 按 Add 顺序遍历，
@@ -115,8 +134,17 @@ type Injector struct {
 
 	// 模拟容量上限（字节）；0=未启用（默认，直透 backing 真实容量）。mount 时按 backing
 	// statfs 校验并固化：保证 capacity∈(backing已用, backing总量)，使 faultfs 模拟的"满"
-	// 先于 backing 真满触发。不被消耗、不进 Refresh（改值需重新挂载）。
-	capacity int64
+	// 先于 backing 真满触发。不被消耗、不进 Refresh（改值需重新挂载）。用 atomic 存取：
+	// Write 热路径 lock-free 读 capacity，避免每 write 额外一次 in.mu。
+	capacity atomic.Int64
+
+	// capacity 已用字节数的运行估值，供容量判定（checkWriteCapacity）读、避免每 write 一次 statfs：
+	// TTL 到期时由真实 statfs 重新对齐（usedCachedAt 为对齐时刻，UnixNano，0=未对齐）；TTL 内则随
+	// 每条放行的 write/fallocate 按 n 乐观累加——否则一个在 TTL 窗口（~10ms）内完成的突发写会一直
+	// 读到旧 used 而全部放行、超额写入（见 usedCacheTTL）。statfs 失败时沿用上次估值（fail-open，
+	// 与 mount 时 statfs 失败拒绝挂载的 fail-closed 互补）。两个原子量无锁读。
+	usedCached   atomic.Int64
+	usedCachedAt atomic.Int64
 
 	// backing（通常 tmpfs）实测性能上限，缓存以便重复 set-latency 复用。calibOnce
 	// 保证首次校准独占执行（并发请求阻塞等待，不重跑 Calibrate）；calibDone 标记是否
@@ -148,6 +176,12 @@ func (in *Injector) Add(r Rule) int {
 	defer in.mu.Unlock()
 	in.nextID++
 	r.ID = in.nextID
+	// HealOnWrite 语义仅对 read 规则有意义（read 命中 EIO、write 触发治愈）。强制 Op=OpRead，
+	// 使 HealOnWrite 规则无论调用方写 Op=""（任意 op）还是误填其它 op，都不会因下游 op 匹配
+	// 的 `r.Op != ""` / `r.Op == OpRead` 守卫而静默退化为"永久 EIO、永不治愈"。
+	if r.HealOnWrite {
+		r.Op = OpRead
+	}
 	rem := r.N
 	if rem == 0 {
 		rem = -1 // 永久
@@ -158,7 +192,7 @@ func (in *Injector) Add(r Rule) int {
 	// 为每块分配独立治愈标志，使部分覆盖 write 只治愈其实际写入的块（真硬盘语义）。
 	// 否则整段模式（healedBlocks==nil），write 命中即整段治愈——兼容 blockSize=1 纯次数
 	// 模式与 OffLen<=0 任意 offset 规则。
-	if r.HealOnWrite && r.Op == OpRead && bs > 1 && r.OffLen > 0 {
+	if r.HealOnWrite && bs > 1 && r.OffLen > 0 {
 		// 按块模式：为每块分配独立治愈标志。但块数过大（OffLen 接近 MaxInt64）时 make 会 OOM，
 		// 故超 maxHealedBlocks 阈值回退整段模式（healedBlocks 留 nil，write 整段治愈、按
 		// blocksNeeded 整体扣 spare）——语义不丢，仅放弃逐块治愈粒度。
@@ -348,16 +382,69 @@ func (in *Injector) SetCapacity(capacity int64) {
 	if capacity < 0 {
 		capacity = 0
 	}
-	in.mu.Lock()
-	defer in.mu.Unlock()
-	in.capacity = capacity
+	in.capacity.Store(capacity)
 }
 
-// Capacity 返回模拟容量上限（字节）；0=未启用。
+// Capacity 返回模拟容量上限（字节）；0=未启用。atomic 读，可在 Write 热路径无锁调用。
 func (in *Injector) Capacity() int64 {
-	in.mu.Lock()
-	defer in.mu.Unlock()
-	return in.capacity
+	return in.capacity.Load()
+}
+
+// backingStatfsUsed/Total 从 syscall.Statfs_t 推算 backing 已用/总量（字节）。按 f_frsize
+// （基本块大小）换算——statfs 的 Blocks/Bfree 以 f_frsize 为单位，而非 f_bsize（"优选传输
+// 块"）；二者在 tmpfs/ext4 等通常相等，但部分 fs/配置不同时只有 frsize 正确。负值钳 0
+// （理论上 Bfree<=Blocks，钳制为防御）。三处容量判定共用此口径，避免漂移。
+func backingStatfsUsed(sf *syscall.Statfs_t) int64 {
+	used := (int64(sf.Blocks) - int64(sf.Bfree)) * int64(sf.Frsize)
+	if used < 0 {
+		used = 0
+	}
+	return used
+}
+
+func backingStatfsTotal(sf *syscall.Statfs_t) int64 {
+	total := int64(sf.Blocks) * int64(sf.Frsize)
+	if total < 0 {
+		total = 0
+	}
+	return total
+}
+
+// capacityUsed 返回 backing 已用字节数的运行估值，供容量判定读。TTL 内随每条放行的 write
+// 乐观累加（见 checkWriteCapacity），使一个在 TTL 窗口（~10ms）内完成的突发写仍会逼近 capacity
+// 而被拦下——纯 TTL 缓存会让突发写一直读到旧 used 而全部放行、超额。TTL 到期时用真实 statfs
+// 重新对齐，修正乐观累加对覆盖写/短写/外部写入的漂移。statfs 失败沿用上次估值（fail-open）。
+func (in *Injector) capacityUsed(backing string) int64 {
+	now := time.Now().UnixNano()
+	if now-in.usedCachedAt.Load() < int64(usedCacheTTL) {
+		return in.usedCached.Load()
+	}
+	var sf syscall.Statfs_t
+	if err := syscall.Statfs(backing, &sf); err != nil {
+		return in.usedCached.Load() // fail-open：沿用上次估值（或 0）
+	}
+	used := backingStatfsUsed(&sf)
+	in.usedCached.Store(used) // 重新对齐到真实值
+	in.usedCachedAt.Store(now)
+	return used
+}
+
+// checkWriteCapacity 按模拟容量上限判定本次写是否放行：cap<=0（未启用）或 n<=0 →放行；
+// 否则取估值（capacityUsed），n > cap-used → ENOSPC；放行则把 n 乐观计入 usedCached，使后续
+// 写看到递增的已用、突发写能逼近 capacity 被拦下（TTL 到期由 statfs 重对齐修正）。保守近似：
+// 覆盖写也按请求字节计，仅在接近满时触发。原子读 capacity + 估值，热路径无锁、不每 write statfs。
+// 设备级判定，与规则注入独立——见 [FaultFile.Write] 在 Check 之前调用，保证规则治愈等副作用
+// 不会在随后判定 ENOSPC 时已落盘（heal-then-ENOSPC 原子性）。
+func (in *Injector) checkWriteCapacity(backing string, n int64) syscall.Errno {
+	cap := in.capacity.Load()
+	if cap <= 0 || n <= 0 {
+		return 0
+	}
+	if n > cap-in.capacityUsed(backing) {
+		return syscall.ENOSPC
+	}
+	in.usedCached.Add(n) // 乐观累计：本次 write 将落地 ~n 字节
+	return 0
 }
 
 // blocksNeeded 计算治愈一段长 offLen 字节的坏区需要消耗多少个 blockSize 字节的备用块：
@@ -377,6 +464,26 @@ func blocksNeeded(offLen, blockSize int64) int64 {
 	return q
 }
 
+// gridBlocksToSpare 把"治愈了 count 个 gridBs 字节的网格块"换算为 liveBs 字节的备用块数
+// （ceil(count*gridBs/liveBs)）。spareCount 以 live blockSize 为单位，而按块治愈的网格用
+// Add 时快照的 s.blockSize——二者不同时（Add 后 SetSpareBlocks 改了 blockSize），直接用
+// 网格块数扣 spareCount 会单位错配。本函数经字节数中转统一口径；gridBs==liveBs 时退化为 count。
+// count 受 maxHealedBlocks 上界、gridBs 有界，乘积不溢出。
+func gridBlocksToSpare(count, gridBs, liveBs int64) int64 {
+	if count <= 0 {
+		return 0
+	}
+	if liveBs < 1 {
+		liveBs = 1
+	}
+	bytes := count * gridBs
+	q := bytes / liveBs
+	if bytes%liveBs != 0 {
+		q++
+	}
+	return q
+}
+
 // Check 返回命中的 errno（0 表示放行，不注入）。op 是操作类型（取 Op* 常量），
 // path 是挂载内相对路径，off/length 是 read/write 的请求起始 offset 与字节数（其他 op
 // 传 0；length 仅 HealOnWrite 按块治愈判定用，整段模式与普通规则忽略）。普通规则命中
@@ -389,9 +496,9 @@ func (in *Injector) Check(op, path string, off, length int64) syscall.Errno {
 		r := s.r
 
 		// op 匹配。HealOnWrite 坏扇区规则的注入点虽是 read，但 write 也要能
-		// 命中它来触发治愈，故放宽到 {read, write}。
+		// 命中它来触发治愈，故放宽到 {read, write}（Add 已把 HealOnWrite 规则的 Op 归一为 OpRead）。
 		if r.Op != "" {
-			if r.HealOnWrite && r.Op == OpRead {
+			if r.HealOnWrite {
 				if op != OpRead && op != OpWrite {
 					continue
 				}
@@ -402,17 +509,22 @@ func (in *Injector) Check(op, path string, off, length int64) syscall.Errno {
 		if r.Path != "" && !strings.Contains(path, r.Path) {
 			continue
 		}
-		// off 匹配仅对 read/write 且显式给了区间（OffLen>0）时启用。
+		// off 匹配：read/write 且显式给了区间（OffLen>0）时，按"请求区间 [off,off+length) 与
+		// 坏区 [r.Off, r.Off+OffLen) 有交集"判定——而非只看请求起点 off。这样起点在坏区前但
+		// 延伸进坏区的覆盖写/读也能命中（HealOnWrite 治愈 / 坏块 EIO），与 coverRange/allHealed
+		// 的区间相交语义一致。端点求和用 addOK 防 off+length / r.Off+OffLen 溢出回绕。
 		if (op == OpRead || op == OpWrite) && r.OffLen > 0 {
-			if off < r.Off || off >= r.Off+r.OffLen {
-				continue
+			rEnd := addOK(r.Off, r.OffLen)
+			reqEnd := addOK(off, length)
+			if off >= rEnd || reqEnd <= r.Off {
+				continue // 区间不相交
 			}
 		}
 
 		// HealOnWrite 坏扇区语义。整段模式（healedBlocks==nil）下 write 命中即整段治愈；
 		// 按块模式下 read/write 按"请求覆盖的块"判定——部分覆盖 write 只治愈其实际写入
 		// 的块，未覆盖块 read 仍 EIO（真硬盘 UNC 语义，避免 backing 旧数据被误读为已修复）。
-		if r.HealOnWrite && r.Op == OpRead {
+		if r.HealOnWrite {
 			switch op {
 			case OpRead:
 				if s.healedBlocks == nil {
@@ -428,13 +540,14 @@ func (in *Injector) Check(op, path string, off, length int64) syscall.Errno {
 				return r.Errno
 			case OpWrite:
 				if s.healedBlocks == nil {
-					// 整段模式：write 命中即整段治愈，按 blocksNeeded(OffLen,blockSize) 扣 spare。
-					// blockSize<=1 或 OffLen<=0 时 blocksNeeded 返回 1（纯次数语义）；按块模式因
-					// 块数超 maxHealedBlocks 回退到此者，则按真实块数整体扣（保留"整段消耗"语义）。
+					// 整段模式：write 命中即整段治愈，按 blocksNeeded(OffLen, liveBlockSize) 扣 spare。
+					// 用 live in.spareBlockSize（非 snapshot s.blockSize）是因为 spareCount 以 live
+					// blockSize 为单位计量——Add 后若 SetSpareBlocks 改了 blockSize，charge 仍与预算同口径。
+					// blockSize<=1 或 OffLen<=0 时 blocksNeeded 返回 1（纯次数语义）。
 					if s.healed {
 						continue
 					}
-					need := blocksNeeded(r.OffLen, s.blockSize)
+					need := blocksNeeded(r.OffLen, in.spareBlockSize)
 					if in.spareCount != -1 && in.spareCount < need {
 						return r.Errno // 备用块不足：write 也 EIO
 					}
@@ -444,10 +557,12 @@ func (in *Injector) Check(op, path string, off, length int64) syscall.Errno {
 					}
 					return 0
 				}
-				// 按块模式：只治愈 write 实际覆盖的块，按新治愈块数扣 spare。
+				// 按块模式：只治愈 write 实际覆盖的块。need = 新治愈的网格块数（每块 s.blockSize 字节）；
+				// charge = 把这些块换算到 live blockSize 的备用块单位（gridBlocksToSpare），使扣费与
+				// spareCount 口径一致——Add 后 SetSpareBlocks 改 blockSize 也不致单位错配。
 				start, end, ok := coverRange(r.Off, r.OffLen, off, length, s.blockSize, len(s.healedBlocks))
 				if !ok {
-					continue // 无交集（off 已在坏区内，理论上不触发），放行
+					continue // 无交集，放行
 				}
 				var need int64
 				for j := start; j <= end; j++ {
@@ -458,14 +573,15 @@ func (in *Injector) Check(op, path string, off, length int64) syscall.Errno {
 				if need == 0 {
 					return 0 // 覆盖块已全治愈，放行
 				}
-				if in.spareCount != -1 && in.spareCount < need {
+				charge := gridBlocksToSpare(need, s.blockSize, in.spareBlockSize)
+				if in.spareCount != -1 && in.spareCount < charge {
 					return r.Errno // 备用块不足：不治愈任何块（原子），write 也 EIO
 				}
 				for j := start; j <= end; j++ {
 					s.healedBlocks[j] = true
 				}
 				if in.spareCount > 0 {
-					in.spareCount -= need // 按新治愈块数整块消耗（-1 无限时不计）
+					in.spareCount -= charge // 按换算后的 live 块数整块消耗（-1 无限时不计）
 				}
 				return 0
 			}
@@ -494,8 +610,11 @@ func coverRange(rOff, rLen, off, length, bs int64, nBlocks int) (start, end int6
 	if rOff > lo {
 		lo = rOff
 	}
-	hi := off + length
-	if regionEnd := rOff + rLen; regionEnd < hi {
+	// 端点用 addOK 求和，防 off+length / rOff+rLen 在 off、rOff 接近 MaxInt64 时溢出回绕
+	// 成负值导致 hi<=lo 误判无交集（坏区 high-offset 写入漏治愈 / 读漏 EIO）。
+	hi := addOK(off, length)
+	regionEnd := addOK(rOff, rLen)
+	if regionEnd < hi {
 		hi = regionEnd
 	}
 	if hi <= lo {

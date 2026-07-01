@@ -176,7 +176,7 @@ func (in *Injector) SetProfileCalibrated(backing string, target LatencyProfile) 
 		in.SetProfile(target)
 		return []string{"backing 性能校准失败(" + calibErr.Error() + ")，已跳过顺序带宽钳制"}
 	default:
-		adj, warns := AdjustProfile(target, 0, measBw) // rand 不钳（增量），仅钳 seq 带宽
+		adj, warns := AdjustProfile(target, measBw) // rand 不钳（增量），仅钳 seq 带宽
 		in.SetProfile(adj)
 		return warns
 	}
@@ -402,16 +402,24 @@ func ParseCapacity(s string) (int64, error) {
 	if err != nil {
 		return 0, &knobParseError{kind: "capacity", raw: s, hint: "示例：100M / 1G / 100MiB（M=MiB，G=GiB）"}
 	}
+	return finiteNonNegInt64("capacity", s, bw)
+}
+
+// finiteNonNegInt64 校验 bw 为有限、非负，Round 后安全转为 int64（防 int64(r) 静默回绕）。
+// ParseCapacity 与 ParseSpareSpec 的块大小共用此"有限非负 + 安全取整"尾段，避免两处复制
+// 漂移（取值校验如空串/单位/整数性由各调用方先做）。kind/raw 用于构造带上下文的 *knobParseError。
+// 溢出判定依赖 math.Round 把 r 吸附到 float64 可表示值：r<float64(MaxInt64)(=2^63) 时
+// r<=2^63-1024<MaxInt64，int64(r) 必然安全。
+func finiteNonNegInt64(kind, raw string, bw float64) (int64, error) {
 	if math.IsNaN(bw) || math.IsInf(bw, 0) {
-		return 0, &knobParseError{kind: "capacity", raw: s, hint: "容量不能为 NaN/Inf"}
+		return 0, &knobParseError{kind: kind, raw: raw, hint: "不能为 NaN/Inf"}
 	}
 	if bw < 0 {
-		return 0, &knobParseError{kind: "capacity", raw: s, hint: "容量不可为负"}
+		return 0, &knobParseError{kind: kind, raw: raw, hint: "不可为负"}
 	}
 	r := math.Round(bw)
-	// 防 int64 溢出：超大值会让 int64(r) 静默回绕（与 ParseSpareSpec 同防范）。
 	if r >= float64(math.MaxInt64) {
-		return 0, &knobParseError{kind: "capacity", raw: s, hint: "容量超出可表示范围"}
+		return 0, &knobParseError{kind: kind, raw: raw, hint: "超出可表示范围"}
 	}
 	return int64(r), nil
 }
@@ -486,17 +494,15 @@ func ParseSpareSpec(s string) (count, blockSize int64, err error) {
 	if bw < 1 {
 		return 0, 0, &knobParseError{kind: "spare", raw: s, hint: "块大小须 >=1 字节"}
 	}
-	r := math.Round(bw)
-	if math.Abs(bw-r) > 1e-9 {
+	if math.Abs(bw-math.Round(bw)) > 1e-9 {
 		return 0, 0, &knobParseError{kind: "spare", raw: s, hint: "块大小须是整数字节"}
 	}
-	// 防 int64 溢出：超大 bw（如 1e20）会让 int64(r) 静默回绕（int64(1e20)==MinInt64），
-	// 随后被 SetSpareBlocks 钳成 blockSize=1，吞掉用户意图。float64(MaxInt64) 无法精确
-	// 表示，用 >= 留出余量，超大值一律拒绝。
-	if r >= float64(math.MaxInt64) {
-		return 0, 0, &knobParseError{kind: "spare", raw: s, hint: "块大小超出可表示范围"}
+	// 有限非负 + 安全取整（含 NaN/Inf/溢出拒绝）共用 finiteNonNegInt64，与 ParseCapacity 同口径。
+	bs, err := finiteNonNegInt64("spare", s, bw)
+	if err != nil {
+		return 0, 0, err
 	}
-	return n, int64(r), nil
+	return n, bs, nil
 }
 
 // formatScaled 把字节数 v 按最短表示选 GiB/MiB/KiB/B 单位阶梯，返回 (数值串, 单位串)。
@@ -701,12 +707,11 @@ func Calibrate(backing string) (randLatency time.Duration, seqBw float64, err er
 
 // AdjustProfile 把目标 profile 的顺序带宽钳制到 backing 实测上限（measuredBw）之内。
 // rand（随机寻址延迟 + 由 applyRandLatency 派生的各元数据 op）语义为"在 backing 上叠加的
-// 增量"——永远让设备更慢，故不钳制、原样透传；measuredRand 参数保留仅为签名兼容，不再起作用。
+// 增量"——永远让设备更慢，故不钳制、原样透传。
 // 顺序带宽语义为"限制上限"：faultfs 通过 per-byte sleep 把 host 速度降到目标，当目标带宽 >
 // backing（想限到的速度比 backing 还快）时实际取 backing 并告警。measuredBw<=0 视为未校准，
 // 带宽字段透传不钳。
-func AdjustProfile(p LatencyProfile, measuredRand time.Duration, measuredBw float64) (LatencyProfile, []string) {
-	_ = measuredRand // rand 现为叠加增量，不钳制；保留参数以维持调用方签名兼容
+func AdjustProfile(p LatencyProfile, measuredBw float64) (LatencyProfile, []string) {
 	out := p
 	var warns []string
 	// 顺序带宽钳制（per-byte → 带宽）：限制语义，目标快于 backing 时取 backing 并告警。
