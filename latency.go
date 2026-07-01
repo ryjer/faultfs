@@ -1,6 +1,7 @@
 package faultfs
 
 import (
+	"os"
 	"strings"
 	"time"
 )
@@ -121,6 +122,46 @@ func (in *Injector) Speed() float64 {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	return in.speed
+}
+
+// calibrateCached 懒校准 backing 目录的实测性能上限（随机寻址延迟 + 顺序带宽），
+// 结果缓存在 Injector 上供后续 set-latency 复用。校准在无锁状态下进行（耗时约几十
+// 毫秒），避免阻塞并发 FUSE 回调；首次调用承担实测开销，之后命中缓存。backing 为空
+// 字符串时跳过校准（钳制阶段据此透传不钳）。
+func (in *Injector) calibrateCached(backing string) (randLatency time.Duration, seqBw float64, err error) {
+	in.mu.Lock()
+	if in.calibDone && !in.calibDirty {
+		r, b, e := in.calibRand, in.calibBw, in.calibErr
+		in.mu.Unlock()
+		return r, b, e
+	}
+	in.mu.Unlock()
+
+	if backing == "" {
+		in.mu.Lock()
+		in.calibDone = true
+		in.calibDirty = false
+		in.calibErr = nil
+		in.calibRand, in.calibBw = 0, 0
+		in.mu.Unlock()
+		return 0, 0, nil
+	}
+
+	r, b, e := Calibrate(backing)
+	in.mu.Lock()
+	in.calibRand, in.calibBw, in.calibErr, in.calibDone = r, b, e, true
+	in.calibDirty = false
+	in.mu.Unlock()
+	return r, b, e
+}
+
+// CalibratedFloor 返回缓存的 backing 实测性能上限（随机寻址延迟、顺序带宽）与是否
+// 已校准。未校准时 randLatency/seqBw 为 0、ok 为 false。库用户可据此判断当前 profile
+// 是否已被钳制到 backing（tmpfs）上限。
+func (in *Injector) CalibratedFloor() (randLatency time.Duration, seqBw float64, ok bool) {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	return in.calibRand, in.calibBw, in.calibDone && in.calibErr == nil && in.calibRand > 0
 }
 
 // sleepFor 阻塞 d×sp（d<=0 不阻塞）。调用时已离开 mu 锁。
@@ -245,7 +286,7 @@ func profileFields(p LatencyProfile) map[string]string {
 		"removexattr":  p.Removexattr.String(),
 		"listxattr":    p.Listxattr.String(),
 		"create":       p.Create.String(),
-		"mkdir":        p.Mkdir.String(),
+		"mkdir":         p.Mkdir.String(),
 		"unlink":       p.Unlink.String(),
 		"rename":       p.Rename.String(),
 		"fsync":        p.Fsync.String(),
@@ -253,4 +294,260 @@ func profileFields(p LatencyProfile) map[string]string {
 		"read_byte":    byteOrUnlimited(p.ReadByte),
 		"write_byte":   byteOrUnlimited(p.WriteByte),
 	}
+}
+
+// ---- 手动性能参数（随机寻址延迟 + 顺序读写速度）----
+
+// 随机寻址延迟与顺序读写速度是用户可手动调节的两个性能旋钮，对应真实设备的两个
+// 核心指标：随机寻道/访问延迟、顺序传输带宽。它们与预设档（ProfileHDD/SSD/Memory）
+// 等价但更直观——前者用 ns/us/ms，后者用 MiB/s、GiB/s。
+
+const (
+	// MiB / GiB 字节数，用于顺序速度单位换算。
+	MiB float64 = 1 << 20
+	GiB float64 = 1 << 30
+)
+
+// ParseLatency 把延迟旋钮字符串解析为 time.Duration。接受 Go duration（"8ms"/
+// "200us"/"200µs"/"100ns"/"5s"，单位 ns/us/ms/s）以及裸整数（视为 ns）。
+func ParseLatency(s string) (time.Duration, error) {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return 0, errEmptyKnob
+	}
+	if d, err := time.ParseDuration(t); err == nil {
+		return d, nil
+	}
+	// 裸整数 → 纳秒（与 latency 的 SI 基本单位一致）。
+	if n, err := parseStrictInt(t); err == nil {
+		return time.Duration(n), nil
+	}
+	return 0, &knobParseError{kind: "latency", raw: s, hint: "示例：8ms / 200us / 100ns"}
+}
+
+// ParseSpeed 把顺序速度旋钮字符串解析为字节/秒。接受 "100M"/"100MiB/s"（=100MiB/s）、
+// "2G"/"2GiB/s"（=2GiB/s）、"512K"/"512KiB/s"，以及裸数字（=字节/秒）。大小写不敏感。
+func ParseSpeed(s string) (float64, error) {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return 0, errEmptyKnob
+	}
+	u := strings.ToLower(t)
+	u = strings.TrimSuffix(u, "/s")
+	mult := 1.0
+	switch {
+	case strings.HasSuffix(u, "gib"):
+		mult, u = GiB, strings.TrimSuffix(u, "gib")
+	case strings.HasSuffix(u, "g"):
+		mult, u = GiB, strings.TrimSuffix(u, "g")
+	case strings.HasSuffix(u, "mib"):
+		mult, u = MiB, strings.TrimSuffix(u, "mib")
+	case strings.HasSuffix(u, "m"):
+		mult, u = MiB, strings.TrimSuffix(u, "m")
+	case strings.HasSuffix(u, "kib"):
+		mult, u = 1 << 10, strings.TrimSuffix(u, "kib")
+	case strings.HasSuffix(u, "k"):
+		mult, u = 1 << 10, strings.TrimSuffix(u, "k")
+	}
+	f, err := parseFloat(strings.TrimSpace(u))
+	if err != nil {
+		return 0, &knobParseError{kind: "speed", raw: s, hint: "示例：100M / 2G / 100MiB/s（M=MiB/s，G=GiB/s）"}
+	}
+	if f < 0 {
+		return 0, &knobParseError{kind: "speed", raw: s, hint: "速度不可为负"}
+	}
+	return f * mult, nil
+}
+
+// FormatSpeed 把字节/秒格式化为人类可读的速度串（如 "100.0MiB/s"、"2.5GiB/s"）。
+func FormatSpeed(bw float64) string {
+	if bw <= 0 {
+		return "unlimited"
+	}
+	switch {
+	case bw >= GiB:
+		return trimZeros(bw/GiB) + "GiB/s"
+	case bw >= MiB:
+		return trimZeros(bw/MiB) + "MiB/s"
+	case bw >= 1<<10:
+		return trimZeros(bw/(1<<10)) + "KiB/s"
+	default:
+		return trimZeros(bw) + "B/s"
+	}
+}
+
+// bwToByteDur 把顺序带宽（字节/秒）换算成 per-byte 延迟；bw<=0 → 0（不限速）。
+func bwToByteDur(bw float64) time.Duration {
+	if bw <= 0 {
+		return 0
+	}
+	return time.Duration(float64(time.Second) / bw)
+}
+
+// byteDurToBw 把 per-byte 延迟换算回带宽（字节/秒）；d<=0 → 0（不限速）。
+func byteDurToBw(d time.Duration) float64 {
+	if d <= 0 {
+		return 0
+	}
+	return float64(time.Second) / float64(d)
+}
+
+// ProfileFromKnobs 由两个手动性能旋钮构建一份完整的 LatencyProfile：rand=随机寻址
+// 延迟（读/写及各元数据 op 均按一次寻址计），seqBw=顺序读写带宽（转成 per-byte 延迟，
+// <=0 表示不限速）。顺序访问的 per-request 部分（*Seq）为 0，由带宽主导。库用户可直接
+// 用它构造 profile，再交给 [Injector.SetProfile]；若需按 backing（tmpfs）上限钳制，再用
+// [Calibrate] + [AdjustProfile]。
+func ProfileFromKnobs(rand time.Duration, seqBw float64) LatencyProfile {
+	p := LatencyProfile{}
+	applyRandLatency(&p, rand)
+	applySeqSpeed(&p, seqBw)
+	return p
+}
+
+// applyRandLatency 把随机寻址延迟 rand 写入 profile 的随机读/写与各元数据 op 字段
+// （真实设备上每个元数据 op 也付出一次寻址代价）。顺序 per-request 字段（*Seq）不动，
+// 顺序访问由带宽（*Byte）主导。
+func applyRandLatency(p *LatencyProfile, rand time.Duration) {
+	p.ReadRand, p.WriteRand = rand, rand
+	p.Open, p.Getattr, p.Statfs, p.Setattr = rand, rand, rand, rand
+	p.Getxattr, p.Setxattr, p.Removexattr, p.Listxattr = rand, rand, rand, rand
+	p.Create, p.Mkdir, p.Unlink, p.Rename = rand, rand, rand, rand
+	p.Fsync, p.Flush = rand, rand
+}
+
+// applySeqSpeed 把顺序读写带宽 seqBw 写入 profile 的 per-byte 字段。
+func applySeqSpeed(p *LatencyProfile, seqBw float64) {
+	p.ReadByte = bwToByteDur(seqBw)
+	p.WriteByte = bwToByteDur(seqBw)
+}
+
+// ---- backing（通常 tmpfs）校准 + 性能钳制 ----
+//
+// faultfs 通过"叠加延迟"模拟更慢的设备，因此可模拟的性能上限 = backing 本身的
+// 性能（最强即基于内存的 tmpfs）。Calibrate 实测 backing 的随机寻址延迟与顺序带宽，
+// AdjustProfile 据此把目标参数里"比 backing 还快"的部分钳制为 0 并告警——这正是
+// "用更强的 tmpfs 模拟更弱的系统；当预设值超出 tmpfs 性能时提示并改用 tmpfs 模拟"。
+
+const (
+	calibSeqSize = 8 << 20 // 校准用顺序文件大小：8 MiB
+	calibBlock   = 4 << 10 // 随机读块大小：4 KiB
+	calibRandOps = 1024    // 随机读采样次数
+)
+
+// Calibrate 测量 backing 目录所在设备的随机寻址延迟（单次 4KiB 随机读均摊）与顺序
+// 读带宽（字节/秒），作为可模拟的性能上限。在 backing 下创建临时文件做实测，结束即删。
+// 用于把用户/预设的目标性能钳制到 backing 实际可达范围内（见 [AdjustProfile]）。
+func Calibrate(backing string) (randLatency time.Duration, seqBw float64, err error) {
+	if err := os.MkdirAll(backing, 0o755); err != nil {
+		return 0, 0, err
+	}
+	f, err := os.CreateTemp(backing, ".faultfs-calib-*")
+	if err != nil {
+		return 0, 0, err
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+
+	buf := make([]byte, calibBlock)
+	// 预分配 calibSeqSize（Truncate 建稀疏文件），再用各不相同的块填充，避免稀疏/
+	// 透明压缩影响读取实测。
+	if err := f.Truncate(int64(calibSeqSize)); err != nil {
+		return 0, 0, err
+	}
+	for off := 0; off < calibSeqSize; off += calibBlock {
+		for i := range buf {
+			buf[i] = byte(off>>10) ^ byte(i)
+		}
+		if _, err := f.WriteAt(buf, int64(off)); err != nil {
+			return 0, 0, err
+		}
+	}
+
+	big := make([]byte, calibSeqSize)
+	// 顺序读：跑两遍，取较快（已预热 page cache）的一遍，贴近 faultfs 实际看到的缓存读。
+	var bestSeq = time.Duration(0)
+	for pass := 0; pass < 2; pass++ {
+		if _, err := f.Seek(0, 0); err != nil {
+			return 0, 0, err
+		}
+		t0 := time.Now()
+		if _, err := f.Read(big); err != nil {
+			return 0, 0, err
+		}
+		if d := time.Since(t0); d > 0 && (bestSeq == 0 || d < bestSeq) {
+			bestSeq = d
+		}
+	}
+	if bestSeq > 0 {
+		seqBw = float64(calibSeqSize) / bestSeq.Seconds()
+	}
+
+	// 随机读：calibRandOps 次散布的 4KiB 读，均摊得单次寻址延迟。
+	offsets := pseudoRandomOffsets(calibSeqSize, calibBlock, calibRandOps)
+	if _, err := f.Seek(0, 0); err != nil {
+		return 0, 0, err
+	}
+	t0 := time.Now()
+	for _, off := range offsets {
+		if _, err := f.ReadAt(buf, off); err != nil {
+			return 0, 0, err
+		}
+	}
+	randLatency = time.Since(t0) / time.Duration(len(offsets))
+	return randLatency, seqBw, nil
+}
+
+// AdjustProfile 把目标 profile 钳制到 backing 实测上限（measuredRand / measuredBw）之内：
+// faultfs 只能叠加延迟，故 effectiveRand = max(0, targetRand - measuredRand)、
+// effectiveByte = max(0, targetByte - measuredByte)。当目标比 backing 更快（被钳到 0）
+// 时产出告警。measuredRand<=0 或 measuredBw<=0 视为该维度未校准，对应字段透传不钳制。
+func AdjustProfile(p LatencyProfile, measuredRand time.Duration, measuredBw float64) (LatencyProfile, []string) {
+	out := p
+	var warns []string
+	// 随机寻址延迟钳制（per-request）。
+	if measuredRand > 0 {
+		out.ReadRand, _ = subClampDur(p.ReadRand, measuredRand, &warns, "随机读")
+		out.WriteRand, _ = subClampDur(p.WriteRand, measuredRand, &warns, "随机写")
+	}
+	// 顺序带宽钳制（per-byte → 带宽）。
+	if measuredBw > 0 {
+		measuredByte := time.Duration(float64(time.Second) / measuredBw)
+		eb, _ := subClampDur(p.ReadByte, measuredByte, &warns, "顺序读")
+		out.ReadByte = eb
+		eb, _ = subClampDur(p.WriteByte, measuredByte, &warns, "顺序写")
+		out.WriteByte = eb
+	}
+	return out, warns
+}
+
+// subClampDur 计算"叠加延迟" = max(0, target - measured)。target<=0 表示无延迟需求，
+// 直接返回 0 不告警；target<measured（目标快于 backing）则钳到 0 并在 warns 追加一条。
+func subClampDur(target, measured time.Duration, warns *[]string, label string) (time.Duration, bool) {
+	if target <= 0 {
+		return 0, false
+	}
+	if measured <= 0 {
+		return target, false
+	}
+	if target > measured {
+		return target - measured, false
+	}
+	*warns = append(*warns, label+"目标("+target.String()+")快于 backing("+measured.String()+")，已钳制到 backing（tmpfs）性能")
+	return 0, true
+}
+
+// pseudoRandomOffsets 用确定性的 xorshift 生成 [0, size-block) 内的伪随机块对齐 offset，
+// 避免引入 math/rand 的全局状态依赖。
+func pseudoRandomOffsets(size, block, n int) []int64 {
+	out := make([]int64, n)
+	state := uint64(0x9e3779b97f4a7c15)
+	nblocks := size / block
+	for i := 0; i < n; i++ {
+		state ^= state << 13
+		state ^= state >> 7
+		state ^= state << 17
+		b := int(state % uint64(nblocks))
+		out[i] = int64(b * block)
+	}
+	return out
 }

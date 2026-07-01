@@ -1,6 +1,7 @@
 // Package control 实现 faultfs 的控制 socket：挂载守护进程（faultfs mount）
-// 在 per-mount unix socket 上监听，`faultfs add/rm/clear/refresh/list/latency/
-// spare` 等子命令作为客户端发送 JSON 请求，在线修改规则引擎与延迟模型。
+// 在 per-mount unix socket 上监听，`faultfs add[/badsector]`、`rm/clear/refresh/
+// list`、`set latency`、`set spare` 等子命令作为客户端发送 JSON 请求，在线修改
+// 规则引擎与设备属性。
 //
 // control 是纯协议 + 传输层：它不 import 父 package faultfs，而是通过一个
 // handler 回调（func(Req) Resp）把请求交回挂载方处理，从而避免循环依赖。
@@ -35,6 +36,10 @@ type Req struct {
 	Profile     string  `json:"profile,omitempty"` // set-latency: "none"/"memory"/"ssd"/"hdd"；空=不改
 	Speed       float64 `json:"speed,omitempty"`
 	HasSpeed    bool    `json:"has_speed,omitempty"` // 区分“未设”与 0
+	RandNs      int64   `json:"rand_ns,omitempty"`   // set-latency: 随机寻址延迟（纳秒）
+	HasRand     bool    `json:"has_rand,omitempty"`
+	SeqBw       float64 `json:"seq_bw,omitempty"` // set-latency: 顺序读写速度（字节/秒）
+	HasSeq      bool    `json:"has_seq,omitempty"`
 	Spare       int64   `json:"spare,omitempty"`
 	HasSpare    bool    `json:"has_spare,omitempty"`
 }
@@ -57,6 +62,7 @@ type RuleView struct {
 type Resp struct {
 	OK      bool       `json:"ok"`
 	Err     string     `json:"err,omitempty"`
+	Warn    string     `json:"warn,omitempty"`    // 非致命告警（如性能参数被钳制到 tmpfs 上限）
 	ID      int        `json:"id,omitempty"`      // add-rule 分配的 ID
 	Rules   []RuleView `json:"rules,omitempty"`   // list-rules / status / dump
 	Profile string     `json:"profile,omitempty"` // status / dump：档名

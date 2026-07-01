@@ -1,9 +1,15 @@
 // Command faultfs 挂载并管理一个可编程故障注入 FUSE 文件系统（测试用）。
 //
 // `faultfs mount` 启动一个 faultfs 守护进程（backing 透传 + 在线 control socket），
-// 其余子命令（add/rm/clear/refresh/list/status/dump/latency/spare/badsector）作为客户端
-// 通过 control socket 在线操控规则引擎与延迟模型，从而让非 Go 程序与 AI 也能构造并
-// 驱动 faultfs。
+// 其余子命令作为客户端通过 control socket 在线操控规则引擎与设备属性：
+//
+//	add <mp> […]           加注入规则；add badsector <mp> […] 加可修复坏扇区
+//	rm/clear/refresh/list  管理规则（refresh 同时重置 spare 到初始值）
+//	set latency <mp> […]   设备延迟档/倍速/性能参数（设备固有属性，非规则）
+//	set spare <mp> <n>     备用扇区预算（设备固有属性）
+//	status/dump            只读快照
+//
+// 设备延迟与备用扇区属于设备固有属性（不能像规则那样增删），故用 set 子命令设置。
 package main
 
 import (
@@ -15,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/ryjer/fss/faultfs"
 	"github.com/ryjer/fss/faultfs/control"
@@ -29,7 +36,7 @@ func main() {
 	root.AddCommand(
 		newMountCmd(), newUnmountCmd(), newAddCmd(), newRmCmd(),
 		newClearCmd(), newRefreshCmd(), newListCmd(), newStatusCmd(),
-		newDumpCmd(), newLatencyCmd(), newSpareCmd(), newBadsectorCmd(),
+		newDumpCmd(), newSetCmd(),
 	)
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
@@ -56,7 +63,8 @@ func newMountCmd() *cobra.Command {
 	return c
 }
 
-// detachSelf 重新以非 detach 模式 fork 自身，新会话脱离终端，父进程立即返回。
+// detachSelf 重新以非 detach 模式 fork 自身，新会话脱离终端；父进程等待 control
+// socket 就绪后返回，从而 `mount --detach` 一返回即可接收 add/set 等子命令。
 func detachSelf(backing, mp string) error {
 	exe, err := os.Executable()
 	if err != nil {
@@ -70,8 +78,33 @@ func detachSelf(backing, mp string) error {
 	if err := c.Start(); err != nil {
 		return fmt.Errorf("detach: %w", err)
 	}
-	fmt.Fprintf(os.Stderr, "faultfs mounted at %s (pid %d, socket %s)\n", mp, c.Process.Pid, control.SocketPath(mp))
+	pid := c.Process.Pid
+	sock := control.SocketPath(mp)
+	// 等待守护进程绑定 control socket（轮询一次 status round-trip）。就绪即返回；
+	// 超时（罕见，如 /dev/fuse 不可用导致子进程已退出）仅告警，不掩盖挂载本身。
+	if rerr := waitReady(sock, 5*time.Second); rerr != nil {
+		fmt.Fprintf(os.Stderr, "faultfs: control socket %s 未就绪（%v）；如挂载失败请检查 /dev/fuse\n", sock, rerr)
+	}
+	fmt.Fprintf(os.Stderr, "faultfs mounted at %s (pid %d, socket %s)\n", mp, pid, sock)
 	return nil
+}
+
+// waitReady 反复向 socket 发一次 status 请求，直到成功 round-trip（守护进程已监听并
+// 服务）或超时。control socket 的 Listen 先于 Serve，故一次成功的响应即代表就绪。
+func waitReady(socket string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for {
+		if _, err := control.Send(socket, control.Req{Cmd: control.CmdStatus}); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		if time.Now().After(deadline) {
+			return lastErr
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
 
 func newUnmountCmd() *cobra.Command {
@@ -137,6 +170,9 @@ func newAddCmd() *cobra.Command {
 	c.Flags().StringVar(&errnoStr, "errno", "EIO", "errno 名（EIO/ENOSPC/EROFS/ESTALE/...）或数字")
 	c.Flags().IntVar(&n, "n", 0, "前 N 次注入（0=永久）")
 	c.Flags().BoolVar(&heal, "heal-on-write", false, "可修复坏扇区（read EIO，write 治愈）")
+	// badsector 作为 add 的子命令：坏扇区本质是"封装为 heal-on-write read 的注入规则"，
+	// 属于规则的范畴，故挂在 add 下而非 set（set 留给设备固有属性）。
+	c.AddCommand(newBadsectorCmd())
 	return c
 }
 
@@ -194,29 +230,72 @@ func newListCmd() *cobra.Command {
 	}
 }
 
-func newLatencyCmd() *cobra.Command {
+// newSetCmd 是"设备固有属性"分组的父命令：latency（延迟档/倍速/性能参数）与
+// spare（备用扇区预算）。这些是设备的属性而非可增删的规则，故用 set 子命令设置。
+func newSetCmd() *cobra.Command {
+	c := &cobra.Command{
+		Use:   "set",
+		Short: "设置设备固有属性（延迟/性能参数、备用扇区预算）",
+	}
+	c.AddCommand(newSetLatencyCmd(), newSetSpareCmd())
+	return c
+}
+
+// newSetLatencyCmd 对应 `faultfs set latency <mp>`：设备延迟档（--profile）、全局倍速
+// （--speed），以及手动性能参数（--rand 随机寻址延迟、--seq 顺序读写速度）。详见
+// spec/latency.md。设备性能受 backing（通常 tmpfs）实际上限约束，超出会告警并钳制。
+func newSetLatencyCmd() *cobra.Command {
 	var profile string
 	var speed float64
+	var randStr, seqStr string
 	c := &cobra.Command{
-		Use: "latency <mp>", Short: "设设备延迟档（--profile）与全局倍速（--speed）", Args: cobra.ExactArgs(1),
+		Use:   "latency <mp>",
+		Short: "设设备延迟档（--profile）、倍速（--speed）或手动性能参数（--rand/--seq）",
+		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			req := control.Req{Cmd: control.CmdSetLatency, Profile: profile}
 			if cmd.Flags().Changed("speed") {
 				req.HasSpeed = true
 				req.Speed = speed
 			}
-			_, err := sendCtl(args[0], req)
-			return err
+			if cmd.Flags().Changed("rand") {
+				d, err := faultfs.ParseLatency(randStr)
+				if err != nil {
+					return err
+				}
+				req.HasRand = true
+				req.RandNs = int64(d)
+			}
+			if cmd.Flags().Changed("seq") {
+				bw, err := faultfs.ParseSpeed(seqStr)
+				if err != nil {
+					return err
+				}
+				req.HasSeq = true
+				req.SeqBw = bw
+			}
+			resp, err := sendCtl(args[0], req)
+			if err != nil {
+				return err
+			}
+			if resp.Warn != "" {
+				fmt.Fprintf(os.Stderr, "warning: %s\n", resp.Warn)
+			}
+			return nil
 		},
 	}
-	c.Flags().StringVar(&profile, "profile", "", "none|memory|ssd|hdd（空=不改）")
+	c.Flags().StringVar(&profile, "profile", "", "预设档：none|memory|ssd|hdd（空=不改）")
 	c.Flags().Float64Var(&speed, "speed", 1.0, "全局倍速（1.0 正常；>1 慢放；<1 快放）")
+	c.Flags().StringVar(&randStr, "rand", "", "随机寻址延迟（单位 ns/us/ms，如 8ms；空=不改）")
+	c.Flags().StringVar(&seqStr, "seq", "", "顺序读写速度（单位 M=MiB/s、G=GiB/s，如 100M；空=不改）")
 	return c
 }
 
-func newSpareCmd() *cobra.Command {
+func newSetSpareCmd() *cobra.Command {
 	return &cobra.Command{
-		Use: "spare <mp> <n>", Short: "设置备用扇区预算（-1 无限）", Args: cobra.ExactArgs(2),
+		Use:   "spare <mp> <n>",
+		Short: "设置备用扇区预算（-1 无限）；refresh 会还原到该初始值",
+		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			n, err := strconv.ParseInt(args[1], 10, 64)
 			if err != nil {
@@ -253,10 +332,13 @@ func newBadsectorCmd() *cobra.Command {
 			return nil
 		},
 	}
-	c.Flags().StringVar(&path, "path", "", "挂载内相对路径子串")
+	c.Flags().StringVar(&path, "path", "", "挂载内相对路径子串（必填）")
 	c.Flags().Int64Var(&off, "off", 0, "坏区起始 offset")
 	c.Flags().Int64Var(&length, "len", 4096, "坏区长度（=OffLen）")
 	c.Flags().IntVar(&spare, "spare", -1, "备用扇区预算（-1 无限）")
+	// --path 必填：空 path 的规则会子串匹配任意文件，对坏扇区这种高危便捷命令而言，
+	// 忘带 --path 而静默生成"全局坏扇区"是不可接受的脚枪，故强制要求显式指定。
+	_ = c.MarkFlagRequired("path")
 	return c
 }
 

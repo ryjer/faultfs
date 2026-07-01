@@ -52,9 +52,9 @@ inj.SetSpeed(2.0) // 慢放 2 倍
 ```sh
 faultfs mount <backing> <mp> [--detach]            # 挂载守护；--detach 后台
 faultfs add <mp> --op read --path a.bin --errno EIO            # 加规则，打印 ID
-faultfs badsector <mp> --path a.bin --off 4096 --len 4096      # 坏扇区（read EIO, write 治愈）
-faultfs latency <mp> --profile hdd --speed 2.0                 # 设备档 + 倍速
-faultfs spare <mp> 4                                          # 备用扇区预算（-1 无限）
+faultfs add badsector <mp> --path a.bin --off 4096 --len 4096      # 坏扇区（read EIO, write 治愈）
+faultfs set latency <mp> --profile hdd --speed 2.0                 # 设备档 + 倍速
+faultfs set spare <mp> 4                                          # 备用扇区预算（-1 无限）
 faultfs list <mp>                                             # 查看规则与运行时状态
 faultfs status <mp>                                           # 精简概览（规则/spare/speed/profile）
 faultfs dump <mp> [--json]                                    # 全量诊断快照（挂载元信息+完整 profile）
@@ -63,11 +63,16 @@ faultfs rm <mp> <id> | faultfs clear <mp>                      # 删除
 faultfs unmount <mp>
 ```
 
-## 规格
+## 文档
 
-详见 [`spec/`](spec/)：
+**用户文档**（[`doc/`](doc/)）—— 怎么用：
+- [doc/library.md](doc/library.md) — **Go 库用法**：模拟各类错误（EIO/ENOSPC/EROFS/坏扇区…），含示例 Go 代码
+- [doc/cli.md](doc/cli.md) — **CLI 用法（非 Go）**：同样的错误用命令模拟，含示例命令与真实命令日志
+
+**规格**（[`spec/`](spec/)）—— 怎么实现：
+- [spec/architecture.md](spec/architecture.md) — 架构图：数据通路、控制通路、包布局
 - [spec/injector.md](spec/injector.md) — 规则引擎：字段、匹配、坏扇区、Refresh、在线 API
-- [spec/latency.md](spec/latency.md) — 性能模型：profile、speed、顺序/随机
+- [spec/latency.md](spec/latency.md) — 性能模型：预设档、rand/seq 旋钮、speed、顺序/随机、tmpfs 钳制
 - [spec/control.md](spec/control.md) — 控制协议 + CLI 子命令
 
 ## 依赖与平台

@@ -4,6 +4,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // 故障注入点：Rule.Op 取这些值之一，或 "" 表示任意 op。
@@ -92,6 +93,14 @@ type Injector struct {
 	initialSpare int64 // 初始 spare（Refresh 还原用）
 	profile      LatencyProfile
 	speed        float64 // 倍率；<=0 视为 1
+
+	// backing（通常 tmpfs）实测性能上限，缓存以便重复 set-latency 复用。calibDone
+	// 标记是否已校准；calibErr 非 nil 表示校准失败（此时跳过钳制）。
+	calibRand  time.Duration
+	calibBw    float64
+	calibErr   error
+	calibDone  bool
+	calibDirty bool // backing 变化时强制重测（当前不触发，预留）
 }
 
 // NewInjector 建一个空规则集：spare 无限、speed 1.0、ProfileNone。

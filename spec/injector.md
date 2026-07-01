@@ -42,7 +42,7 @@
 ## spare 备用预算
 
 `Injector.spare`（int64，`-1`=无限，默认 `-1`）。每治愈一次消耗一格。`SetSpare(n)`
-同步更新初始快照（故 `Refresh` 会还原到该值）。CLI: `faultfs spare <mp> <n>`。
+同步更新初始快照（故 `Refresh` 会还原到该值）。CLI: `faultfs set spare <mp> <n>`。
 
 ## Refresh
 

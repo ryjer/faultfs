@@ -22,8 +22,20 @@
 // op 上并存。每条 Rule 可精确到 文件（Path 子串）+ 位置（Off/OffLen 区间）+
 // 错误（Errno）+ 次数（N，前 N 次后自愈）。详见 [Rule] 字段文档。
 //
-// 注意：FUSE 在内核层会短路某些“无实际变更”的操作。例如 chmod 设置与当前权限
-// 相同的值时，内核不会向 faultfs 发送 SETATTR 请求，注入规则因此不会触发。
-// 测试时请确保操作确实改变了文件属性（如 chmod 755 而非 chmod 644），否则
-// 操作会静默成功而非触发注入错误。
+// 注意（无变更操作是否触发注入）：faultfs 本身、以及 Linux VFS/FUSE 内核，都**不会**
+// 短路"无实际变更"的操作——这一点由 [TestNoOpOpsReachFaultfs] 与
+// [TestNoOpWritePersistsToBacking] 回归保护。设置与当前值相同的 chmod / utimes /
+// truncate，或写入与现状逐字节相同的数据，只要系统调用真的发出，内核就会把它转发给
+// faultfs：命中注入规则时照常返回注入的 errno（如 EIO）；未命中则透传到 backing 真实
+// 落盘（backing 的 mtime 会推进）。
+//
+// 但要当心**用户态工具**自身的短路：coreutils/uutils 的 `chmod`、`chown` 在目标值与
+// 当前值相同时会**跳过系统调用**（请求根本不发给内核，自然到不了 faultfs），此时注入
+// 规则不会触发。这并非内核或 faultfs 的行为，而是这些工具的优化。因此测试 setattr 注入
+// 时，要么改一个不同的值，要么用一个总是发起系统调用的方式（`truncate`、`touch`，或 Go
+// 的 [os.Chmod]——后者不经"无变化"判断，总是调用 chmod(2)）。write 路径无此问题：`dd`
+// 等总是发起 write(2)，写同值也会落盘、也会触发规则。
+//
+// 早期文档曾担心"FUSE 内核短路同值 setattr"，经实测在 Linux FUSE 上并不成立（内核照
+// 发 SETATTR）；真正会短路同值的是上述用户态工具。
 package faultfs

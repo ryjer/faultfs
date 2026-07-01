@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -344,7 +345,10 @@ func handleControl(inj *Injector, meta mountMeta, req control.Req) control.Resp 
 		}
 		return control.Resp{OK: true, ID: inj.Add(r)}
 	case control.CmdDeleteRule:
-		return control.Resp{OK: inj.Delete(req.ID)}
+		if !inj.Delete(req.ID) {
+			return control.Resp{OK: false, Err: fmt.Sprintf("规则 id %d 不存在", req.ID)}
+		}
+		return control.Resp{OK: true}
 	case control.CmdClear:
 		inj.Clear()
 		return control.Resp{OK: true}
@@ -354,20 +358,11 @@ func handleControl(inj *Injector, meta mountMeta, req control.Req) control.Resp 
 		inj.Refresh()
 		return control.Resp{OK: true}
 	case control.CmdSetLatency:
-		if req.Profile == "" && !req.HasSpeed {
-			return control.Resp{OK: false, Err: "no profile or speed specified; use --profile and/or --speed"}
+		warns, err := setLatency(inj, meta.backing, req)
+		if err != nil {
+			return control.Resp{OK: false, Err: err.Error()}
 		}
-		if req.Profile != "" {
-			p, ok := ProfileByName(req.Profile)
-			if !ok {
-				return control.Resp{OK: false, Err: "unknown profile: " + req.Profile}
-			}
-			inj.SetProfile(p)
-		}
-		if req.HasSpeed {
-			inj.SetSpeed(req.Speed)
-		}
-		return control.Resp{OK: true}
+		return control.Resp{OK: true, Warn: warns}
 	case control.CmdSetSpare:
 		if !req.HasSpare {
 			return control.Resp{OK: false, Err: "no spare value specified"}
@@ -389,6 +384,67 @@ type mountMeta struct {
 	socket    string
 	mountTime string // RFC3339
 }
+
+// setLatency 处理 set-latency：解析预设档/手动性能旋钮/--speed，按 backing 实测上限
+// 钳制后写入 profile，倍速单独写入。返回告警串（可能为空）与错误（参数非法时）。
+// 钳制规则见 [AdjustProfile]：目标快于 backing（tmpfs）的部分被钳到 0 并告警。
+func setLatency(inj *Injector, backing string, req control.Req) (string, error) {
+	if req.Profile == "" && !req.HasSpeed && !req.HasRand && !req.HasSeq {
+		return "", errf("未指定任何参数；用 --profile / --rand / --seq / --speed 之一")
+	}
+
+	// 1) 确定目标 profile（预设档、手动旋钮，或两者叠加）。仅当给了 profile/rand/seq
+	//    才有"目标"需要钳制；仅给 --speed 时不改 profile。
+	var (
+		target     LatencyProfile
+		haveTarget bool
+	)
+	if req.Profile != "" {
+		p, ok := ProfileByName(req.Profile)
+		if !ok {
+			return "", errf("未知预设档：%q（none/memory/ssd/hdd）", req.Profile)
+		}
+		target = p
+		haveTarget = true
+	}
+	if req.HasRand || req.HasSeq {
+		if !haveTarget {
+			target = ProfileNone // 从零开始构建
+		}
+		if req.HasRand {
+			applyRandLatency(&target, time.Duration(req.RandNs))
+		}
+		if req.HasSeq {
+			applySeqSpeed(&target, req.SeqBw)
+		}
+		haveTarget = true
+	}
+
+	// 2) 按 backing 实测上限钳制，写入 profile。
+	var warns []string
+	if haveTarget {
+		measRand, measBw, calibErr := inj.calibrateCached(backing)
+		switch {
+		case calibErr != nil:
+			// 校准失败不阻断：透传目标，仅告警。
+			warns = append(warns, "backing 性能校准失败("+calibErr.Error()+")，已跳过 tmpfs 钳制")
+		case measRand > 0 || measBw > 0:
+			adj, w := AdjustProfile(target, measRand, measBw)
+			target = adj
+			warns = append(warns, w...)
+		}
+		inj.SetProfile(target)
+	}
+
+	// 3) 全局倍速。
+	if req.HasSpeed {
+		inj.SetSpeed(req.Speed)
+	}
+	return strings.Join(warns, "; "), nil
+}
+
+// errf 是 fmt.Errorf 的简写，避免在本文件多处重复 fmt.Errorf。
+func errf(format string, args ...any) error { return fmt.Errorf(format, args...) }
 
 // buildDump 构造一份全量快照：规则 + 挂载元信息 + 完整延迟 profile。
 func buildDump(inj *Injector, meta mountMeta) *control.DumpView {
