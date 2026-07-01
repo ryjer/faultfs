@@ -1,15 +1,12 @@
 package faultfs
 
 import (
-	"errors"
 	"strconv"
-	"strings"
 )
 
-// errEmptyKnob 表示手动性能旋钮（--rand/--seq）给了空字符串。
-var errEmptyKnob = errors.New("空值")
-
-// knobParseError 是手动性能旋钮解析失败的错误，携带 kind/raw/hint 便于 CLI 展示。
+// knobParseError 是手动性能旋钮（--rand/--seq）解析失败的错误，携带 kind/raw/hint
+// 便于 CLI 展示。空串与无法解析的值都走这一种结构化错误（不再用裸 sentinel，
+// 让空值也能给出带上下文的提示）。
 type knobParseError struct {
 	kind string
 	raw  string
@@ -30,10 +27,9 @@ func parseFloat(s string) (float64, error) {
 	return strconv.ParseFloat(s, 64)
 }
 
-// trimZeros 去掉浮点字符串末尾多余的 0（保留 1 位小数含义），如 "100.0"→"100"、"2.50"→"2.5"。
-func trimZeros(f float64) string {
-	s := strconv.FormatFloat(f, 'f', 2, 64)
-	s = strings.TrimRight(s, "0")
-	s = strings.TrimSuffix(s, ".")
-	return s
+// trimFloat 把浮点格式化为最短可往返表示（自动去掉末尾多余的 0 与孤立的小数点），
+// 如 100.0→"100"、2.5→"2.5"。等价于 strconv.FormatFloat(f,'f',-1,64)（-1=最短表示），
+// 比固定 2 位小数再裁 0 更准确（不会把 2.555 截成 "2.56"）。
+func trimFloat(f float64) string {
+	return strconv.FormatFloat(f, 'f', -1, 64)
 }

@@ -94,13 +94,15 @@ type Injector struct {
 	profile      LatencyProfile
 	speed        float64 // 倍率；<=0 视为 1
 
-	// backing（通常 tmpfs）实测性能上限，缓存以便重复 set-latency 复用。calibDone
-	// 标记是否已校准；calibErr 非 nil 表示校准失败（此时跳过钳制）。
-	calibRand  time.Duration
-	calibBw    float64
-	calibErr   error
-	calibDone  bool
-	calibDirty bool // backing 变化时强制重测（当前不触发，预留）
+	// backing（通常 tmpfs）实测性能上限，缓存以便重复 set-latency 复用。calibOnce
+	// 保证首次校准独占执行（并发请求阻塞等待，不重跑 Calibrate）；calibDone 标记是否
+	// 已校准，calibErr 非 nil 表示校准失败（此时跳过钳制）。Injector 始终以指针使用，
+	// 故 sync.Once 不会被复制。
+	calibRand time.Duration
+	calibBw   float64
+	calibErr  error
+	calibDone bool
+	calibOnce sync.Once
 }
 
 // NewInjector 建一个空规则集：spare 无限、speed 1.0、ProfileNone。

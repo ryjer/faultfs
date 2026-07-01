@@ -81,9 +81,10 @@ func detachSelf(backing, mp string) error {
 	pid := c.Process.Pid
 	sock := control.SocketPath(mp)
 	// 等待守护进程绑定 control socket（轮询一次 status round-trip）。就绪即返回；
-	// 超时（罕见，如 /dev/fuse 不可用导致子进程已退出）仅告警，不掩盖挂载本身。
+	// 超时通常意味着子进程已退出（如 /dev/fuse 不可用、backing 无效）——返回错误让
+	// mount 以非零退出，避免脚本误以为挂载成功、却在下一条命令（add/set…）上才失败。
 	if rerr := waitReady(sock, 5*time.Second); rerr != nil {
-		fmt.Fprintf(os.Stderr, "faultfs: control socket %s 未就绪（%v）；如挂载失败请检查 /dev/fuse\n", sock, rerr)
+		return fmt.Errorf("mount: control socket %s 未就绪（%v）；守护进程可能未成功挂载（请检查 /dev/fuse 与 backing）", sock, rerr)
 	}
 	fmt.Fprintf(os.Stderr, "faultfs mounted at %s (pid %d, socket %s)\n", mp, pid, sock)
 	return nil
@@ -244,6 +245,7 @@ func newSetCmd() *cobra.Command {
 // newSetLatencyCmd 对应 `faultfs set latency <mp>`：设备延迟档（--profile）、全局倍速
 // （--speed），以及手动性能参数（--rand 随机寻址延迟、--seq 顺序读写速度）。详见
 // spec/latency.md。设备性能受 backing（通常 tmpfs）实际上限约束，超出会告警并钳制。
+// --profile 与 --rand/--seq 互斥（叠加会产生难解释的混合 profile）；--speed 可与任一组合。
 func newSetLatencyCmd() *cobra.Command {
 	var profile string
 	var speed float64
@@ -278,16 +280,16 @@ func newSetLatencyCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if resp.Warn != "" {
-				fmt.Fprintf(os.Stderr, "warning: %s\n", resp.Warn)
+			for _, w := range resp.Warns {
+				fmt.Fprintf(os.Stderr, "warning: %s\n", w)
 			}
 			return nil
 		},
 	}
 	c.Flags().StringVar(&profile, "profile", "", "预设档：none|memory|ssd|hdd（空=不改）")
 	c.Flags().Float64Var(&speed, "speed", 1.0, "全局倍速（1.0 正常；>1 慢放；<1 快放）")
-	c.Flags().StringVar(&randStr, "rand", "", "随机寻址延迟（单位 ns/us/ms，如 8ms；空=不改）")
-	c.Flags().StringVar(&seqStr, "seq", "", "顺序读写速度（单位 M=MiB/s、G=GiB/s，如 100M；空=不改）")
+	c.Flags().StringVar(&randStr, "rand", "", "随机寻址延迟（单位 ns/us/ms，如 8ms；空=不改；不可为负）")
+	c.Flags().StringVar(&seqStr, "seq", "", "顺序读写速度（单位 M=MiB/s、G=GiB/s，如 100M；空=不改；最小 1 B/s，0=不限速）")
 	return c
 }
 
@@ -315,6 +317,15 @@ func newBadsectorCmd() *cobra.Command {
 		Use: "badsector <mp>", Short: "标记坏扇区（read EIO，write 治愈）：封装为 --heal-on-write read 规则", Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			mp := args[0]
+			// 先设 spare（如指定）：坏扇区规则由 write 触发治愈并消耗 spare，故 spare 必须在
+			// 规则生效前就位。若先加规则、后设 spare 且后者失败，规则会带着非预期的 spare
+			// （可能 -1 无限）留存，治愈静默不消耗预算。故先设 spare：规则添加失败时最多留下
+			// 用户显式指定的 spare（无害的设备属性），不会留下"坏扇区规则 + 错误 spare"。
+			if cmd.Flags().Changed("spare") {
+				if _, err := sendCtl(mp, control.Req{Cmd: control.CmdSetSpare, Spare: int64(spare), HasSpare: true}); err != nil {
+					return err
+				}
+			}
 			req := control.Req{
 				Cmd: control.CmdAddRule, Op: faultfs.OpRead, Path: path,
 				Off: off, OffLen: length, Errno: int(syscall.EIO), HealOnWrite: true,
@@ -322,11 +333,6 @@ func newBadsectorCmd() *cobra.Command {
 			resp, err := sendCtl(mp, req)
 			if err != nil {
 				return err
-			}
-			if cmd.Flags().Changed("spare") {
-				if _, err := sendCtl(mp, control.Req{Cmd: control.CmdSetSpare, Spare: int64(spare), HasSpare: true}); err != nil {
-					return err
-				}
 			}
 			fmt.Println(resp.ID)
 			return nil

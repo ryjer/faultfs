@@ -62,7 +62,7 @@ type RuleView struct {
 type Resp struct {
 	OK      bool       `json:"ok"`
 	Err     string     `json:"err,omitempty"`
-	Warn    string     `json:"warn,omitempty"`    // 非致命告警（如性能参数被钳制到 tmpfs 上限）
+	Warns   []string   `json:"warns,omitempty"`   // 非致命告警（如性能参数被钳制到 tmpfs 上限），逐条输出
 	ID      int        `json:"id,omitempty"`      // add-rule 分配的 ID
 	Rules   []RuleView `json:"rules,omitempty"`   // list-rules / status / dump
 	Profile string     `json:"profile,omitempty"` // status / dump：档名

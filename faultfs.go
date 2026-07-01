@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -362,7 +361,7 @@ func handleControl(inj *Injector, meta mountMeta, req control.Req) control.Resp 
 		if err != nil {
 			return control.Resp{OK: false, Err: err.Error()}
 		}
-		return control.Resp{OK: true, Warn: warns}
+		return control.Resp{OK: true, Warns: warns}
 	case control.CmdSetSpare:
 		if !req.HasSpare {
 			return control.Resp{OK: false, Err: "no spare value specified"}
@@ -386,61 +385,51 @@ type mountMeta struct {
 }
 
 // setLatency 处理 set-latency：解析预设档/手动性能旋钮/--speed，按 backing 实测上限
-// 钳制后写入 profile，倍速单独写入。返回告警串（可能为空）与错误（参数非法时）。
-// 钳制规则见 [AdjustProfile]：目标快于 backing（tmpfs）的部分被钳到 0 并告警。
-func setLatency(inj *Injector, backing string, req control.Req) (string, error) {
+// 钳制后写入 profile，倍速单独写入。返回告警列表（可能为空）与错误（参数非法时）。
+// 钳制由 [Injector.SetProfileCalibrated] 统一完成（与库用户共用同一实现）。
+// --profile 与 --rand/--seq 互斥（叠加会产生难解释的半覆盖混合 profile）；--speed
+// 可与任一组合。
+func setLatency(inj *Injector, backing string, req control.Req) ([]string, error) {
 	if req.Profile == "" && !req.HasSpeed && !req.HasRand && !req.HasSeq {
-		return "", errf("未指定任何参数；用 --profile / --rand / --seq / --speed 之一")
+		return nil, errf("未指定任何参数；用 --profile / --rand / --seq / --speed 之一")
+	}
+	// 预设档与手动旋钮互斥：二者叠加时旋钮只覆盖随机/带宽字段，预设的其余字段
+	// （如顺序 per-request、带宽）会静默保留，形成既非预设也非旋钮意图的混合 profile。
+	// 自定义组合请用库 API ProfileFromKnobs。
+	if req.Profile != "" && (req.HasRand || req.HasSeq) {
+		return nil, errf("--profile 与 --rand/--seq 互斥：预设档与手动旋钮请二选一")
 	}
 
-	// 1) 确定目标 profile（预设档、手动旋钮，或两者叠加）。仅当给了 profile/rand/seq
-	//    才有"目标"需要钳制；仅给 --speed 时不改 profile。
-	var (
-		target     LatencyProfile
-		haveTarget bool
-	)
-	if req.Profile != "" {
-		p, ok := ProfileByName(req.Profile)
-		if !ok {
-			return "", errf("未知预设档：%q（none/memory/ssd/hdd）", req.Profile)
-		}
-		target = p
-		haveTarget = true
-	}
-	if req.HasRand || req.HasSeq {
-		if !haveTarget {
-			target = ProfileNone // 从零开始构建
+	var warns []string
+	if req.Profile != "" || req.HasRand || req.HasSeq {
+		var target LatencyProfile
+		switch {
+		case req.Profile != "":
+			p, ok := ProfileByName(req.Profile)
+			if !ok {
+				return nil, errf("未知预设档：%q（none/memory/ssd/hdd）", req.Profile)
+			}
+			target = p
+		default:
+			target = ProfileNone // 从零开始用手动旋钮构建
 		}
 		if req.HasRand {
+			if req.RandNs < 0 {
+				return nil, errf("--rand 不能为负（得到 %d ns）", req.RandNs)
+			}
 			applyRandLatency(&target, time.Duration(req.RandNs))
 		}
 		if req.HasSeq {
 			applySeqSpeed(&target, req.SeqBw)
 		}
-		haveTarget = true
+		warns = append(warns, inj.SetProfileCalibrated(backing, target)...)
 	}
 
-	// 2) 按 backing 实测上限钳制，写入 profile。
-	var warns []string
-	if haveTarget {
-		measRand, measBw, calibErr := inj.calibrateCached(backing)
-		switch {
-		case calibErr != nil:
-			// 校准失败不阻断：透传目标，仅告警。
-			warns = append(warns, "backing 性能校准失败("+calibErr.Error()+")，已跳过 tmpfs 钳制")
-		case measRand > 0 || measBw > 0:
-			adj, w := AdjustProfile(target, measRand, measBw)
-			target = adj
-			warns = append(warns, w...)
-		}
-		inj.SetProfile(target)
-	}
-
-	// 3) 全局倍速。
+	// 全局倍速（可与 profile 或旋钮并存）。
 	if req.HasSpeed {
 		inj.SetSpeed(req.Speed)
 	}
-	return strings.Join(warns, "; "), nil
+	return warns, nil
 }
 
 // errf 是 fmt.Errorf 的简写，避免在本文件多处重复 fmt.Errorf。

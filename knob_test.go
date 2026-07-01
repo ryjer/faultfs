@@ -4,6 +4,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/ryjer/fss/faultfs/control"
 )
 
 func TestParseLatency(t *testing.T) {
@@ -172,5 +174,135 @@ func TestCalibrateMeasuresBacking(t *testing.T) {
 	// 残留校准文件应被清理。
 	if ents, _ := os.ReadDir(dir); len(ents) != 0 {
 		t.Errorf("校准后 backing 应无残留文件，得 %d 项", len(ents))
+	}
+}
+
+// TestParseLatencyRejectsNegative:负延迟会让 sleepFor 静默当作不延迟（"要慢却变快"），
+// 故须显式拒绝。
+func TestParseLatencyRejectsNegative(t *testing.T) {
+	for _, bad := range []string{"-8ms", "-100", "-5s"} {
+		if _, err := ParseLatency(bad); err == nil {
+			t.Errorf("ParseLatency(%q) 期望失败（负值），却成功", bad)
+		}
+	}
+}
+
+// TestParseLatencyEmptyHint:空串应给出带 kind/示例的结构化错误，而非裸 "空值"。
+func TestParseLatencyEmptyHint(t *testing.T) {
+	_, err := ParseLatency("")
+	if err == nil {
+		t.Fatal("ParseLatency(\"\") 期望失败")
+	}
+	if _, ok := err.(*knobParseError); !ok {
+		t.Errorf("空串应返回 *knobParseError（带上下文），得 %T", err)
+	}
+}
+
+// TestParseSpeedValidation:NaN/Inf 与过小正带宽（<1 B/s，per-byte 延迟会溢出或挂死）须拒绝；
+// 0 合法（=不限速）。
+func TestParseSpeedValidation(t *testing.T) {
+	for _, bad := range []string{"NaN", "nan", "Inf", "inf", "1e-10", "0.5", "0.0001"} {
+		if _, err := ParseSpeed(bad); err == nil {
+			t.Errorf("ParseSpeed(%q) 期望失败，却成功", bad)
+		}
+	}
+	// 0（含带单位）= 不限速，合法。
+	for _, z := range []string{"0", "0M", "0G"} {
+		got, err := ParseSpeed(z)
+		if err != nil || got != 0 {
+			t.Errorf("ParseSpeed(%q) = %v,%v；want 0（不限速）", z, got, err)
+		}
+	}
+	// 1 B/s 是允许的下限；0.5K = 512 B/s 合法。
+	if got, _ := ParseSpeed("1"); got != 1 {
+		t.Errorf("ParseSpeed(\"1\") = %v，want 1", got)
+	}
+	if got, _ := ParseSpeed("0.5K"); got != 512 {
+		t.Errorf("ParseSpeed(\"0.5K\") = %v，want 512", got)
+	}
+}
+
+// TestBwToByteDurOverflowSafe:极慢带宽的 per-byte 延迟不得回绕成负（否则 sleepFor
+// 静默不延迟）。应钳到最大正 Duration。
+func TestBwToByteDurOverflowSafe(t *testing.T) {
+	if d := bwToByteDur(1e-10); d <= 0 {
+		t.Errorf("bwToByteDur(1e-10) = %v，应钳到正 Duration（非负），避免回绕", d)
+	}
+	if d := bwToByteDur(0); d != 0 {
+		t.Errorf("bwToByteDur(0) = %v，want 0", d)
+	}
+	if d := bwToByteDur(-1); d != 0 {
+		t.Errorf("bwToByteDur(-1) = %v，want 0", d)
+	}
+}
+
+// TestAddByteDelayOverflowSafe:perByte × n 溢出时不得回绕成负。
+func TestAddByteDelayOverflowSafe(t *testing.T) {
+	got := addByteDelay(0, 10*time.Second, 1<<55) // 1e10ns × ~3.6e16 → 溢出
+	if got <= 0 {
+		t.Errorf("溢出的 per-byte 延迟回绕成非正：%v（应钳到正）", got)
+	}
+	if got := addByteDelay(5*time.Millisecond, 0, 100); got != 5*time.Millisecond {
+		t.Errorf("perByte=0 不应叠加：%v", got)
+	}
+}
+
+// TestFormatSpeedFractional:FormatSpeed 用最短浮点表示，2.5GiB/s 不被多余小数位污染。
+func TestFormatSpeedFractional(t *testing.T) {
+	if s := FormatSpeed(2.5 * GiB); s != "2.5GiB/s" {
+		t.Errorf("FormatSpeed(2.5GiB)=%q want 2.5GiB/s", s)
+	}
+}
+
+// TestAdjustProfileClampsMetadata:元数据 op 由 rand 派生（见 applyRandLatency），
+// --rand 快于 backing 时应一并钳到 0；慢于 backing 时减去 backing 贡献且不告警。
+func TestAdjustProfileClampsMetadata(t *testing.T) {
+	fast := ProfileFromKnobs(1*time.Nanosecond, 0) // rand=1ns，快于 backing
+	adj, _ := AdjustProfile(fast, 1*time.Microsecond, 0)
+	for name, d := range map[string]time.Duration{
+		"Open": adj.Open, "Getattr": adj.Getattr, "Create": adj.Create, "Statfs": adj.Statfs,
+	} {
+		if d != 0 {
+			t.Errorf("%s 应钳到 0（rand 派生、快于 backing）：%v", name, d)
+		}
+	}
+
+	slow := ProfileFromKnobs(8*time.Millisecond, 0)
+	adj2, warns := AdjustProfile(slow, 1*time.Microsecond, 0)
+	if adj2.Open != 8*time.Millisecond-1*time.Microsecond {
+		t.Errorf("Open 应为 8ms-1µs（减去 backing 贡献）：%v", adj2.Open)
+	}
+	if len(warns) != 0 {
+		t.Errorf("目标慢于 backing 不应告警：%v", warns)
+	}
+}
+
+// TestSetLatencyValidation:set-latency 的参数校验：profile×knob 互斥、负 rand 拒绝、
+// 无参数拒绝；profile+speed、单独 --rand 合法。
+func TestSetLatencyValidation(t *testing.T) {
+	inj := NewInjector()
+	backing := t.TempDir()
+
+	if _, err := setLatency(inj, backing, control.Req{Profile: "hdd", HasRand: true, RandNs: 8_000_000}); err == nil {
+		t.Fatal("profile + --rand 应互斥报错")
+	}
+	if _, err := setLatency(inj, backing, control.Req{HasRand: true, RandNs: -1}); err == nil {
+		t.Fatal("负 --rand 应报错")
+	}
+	if _, err := setLatency(inj, backing, control.Req{Profile: "hdd", HasSeq: true, SeqBw: 100}); err == nil {
+		t.Fatal("profile + --seq 应互斥报错")
+	}
+	if _, err := setLatency(inj, backing, control.Req{}); err == nil {
+		t.Fatal("无参数应报错")
+	}
+	if _, err := setLatency(inj, backing, control.Req{Profile: "xyz"}); err == nil {
+		t.Fatal("未知预设档应报错")
+	}
+	// 合法组合。
+	if _, err := setLatency(inj, backing, control.Req{Profile: "ssd", HasSpeed: true, Speed: 2}); err != nil {
+		t.Fatalf("profile + speed 应成功：%v", err)
+	}
+	if _, err := setLatency(inj, backing, control.Req{HasRand: true, RandNs: 8_000_000}); err != nil {
+		t.Fatalf("仅 --rand 应成功（触发 backing 校准+钳制）：%v", err)
 	}
 }
