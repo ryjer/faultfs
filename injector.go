@@ -30,6 +30,12 @@ const (
 	OpFlush       = "flush"
 )
 
+// maxHealedBlocks 限制 HealOnWrite 按块模式分配的 healed 标志数，防 OffLen 极大（如
+// MaxInt64）时 make([]bool, N) OOM。超此阈值的规则回退整段模式（healedBlocks 留 nil，
+// write 整段治愈、按 blocksNeeded 整体扣 spare）——语义不丢，仅放弃逐块治愈粒度。
+// 1<<20 块 × 4KiB = 4GiB 坏区，远超实际坏扇区规模。
+const maxHealedBlocks = 1 << 20
+
 // Rule 描述一条故障注入规则。一个 [Injector] 可同时持有任意多条 Rule，
 // 同一时刻多种错误可在不同文件/位置/op 上并存。Check 按 Add 顺序遍历，
 // 首条命中即返回（多条同时命中同一请求时，Add 顺序决定优先级）。
@@ -71,17 +77,21 @@ type Rule struct {
 
 // ruleState 是一条规则的运行时状态，与 Rule 配置分离，以便 Refresh 还原。
 type ruleState struct {
-	r          Rule
-	remaining  int  // 当前剩余命中次数；-1 表示永久
-	initialRem int  // 初始 remaining（Refresh 还原用）
-	healed     bool // HealOnWrite 规则是否已被 write 治愈
+	r            Rule
+	remaining    int    // 当前剩余命中次数；-1 表示永久
+	initialRem   int    // 初始 remaining（Refresh 还原用）
+	healed       bool   // 整段模式（healedBlocks==nil）下是否已被 write 治愈
+	healedBlocks []bool // 按块模式：每块是否治愈；nil = 整段模式（用 healed）
+	blockSize    int64  // Add 时快照的 spareBlockSize，固化块划分（避免后续 SetSpareBlocks 改值致 healed 标记错位）
 }
 
 // RuleView 是 [Injector.List] 返回的规则视图，含运行时状态（只读快照）。
 type RuleView struct {
 	Rule
-	Healed    bool
-	Remaining int // -1 表示永久
+	Healed       bool
+	HealedBlocks int // HealOnWrite 按块模式：已治愈块数；整段模式 = healed?1:0；非 HealOnWrite = 0
+	TotalBlocks  int // HealOnWrite 按块模式：总块数；整段模式 = 1；非 HealOnWrite = 0
+	Remaining    int // -1 表示永久
 }
 
 // Injector 是线程安全的故障注入规则集 + 设备性能模型。多个 FUSE 回调与
@@ -102,6 +112,11 @@ type Injector struct {
 	initialProfile        LatencyProfile // 初始 profile（Refresh 还原用）
 	speed                 float64        // 倍率；<=0 视为 1
 	initialSpeed          float64        // 初始 speed（Refresh 还原用）
+
+	// 模拟容量上限（字节）；0=未启用（默认，直透 backing 真实容量）。mount 时按 backing
+	// statfs 校验并固化：保证 capacity∈(backing已用, backing总量)，使 faultfs 模拟的"满"
+	// 先于 backing 真满触发。不被消耗、不进 Refresh（改值需重新挂载）。
+	capacity int64
 
 	// backing（通常 tmpfs）实测性能上限，缓存以便重复 set-latency 复用。calibOnce
 	// 保证首次校准独占执行（并发请求阻塞等待，不重跑 Calibrate）；calibDone 标记是否
@@ -137,7 +152,21 @@ func (in *Injector) Add(r Rule) int {
 	if rem == 0 {
 		rem = -1 // 永久
 	}
-	in.rules = append(in.rules, ruleState{r: r, remaining: rem, initialRem: rem})
+	bs := in.spareBlockSize
+	s := ruleState{r: r, remaining: rem, initialRem: rem, blockSize: bs}
+	// HealOnWrite 坏扇区且按块模式（blockSize>1 且 OffLen>0）：按 ceil(OffLen/blockSize)
+	// 为每块分配独立治愈标志，使部分覆盖 write 只治愈其实际写入的块（真硬盘语义）。
+	// 否则整段模式（healedBlocks==nil），write 命中即整段治愈——兼容 blockSize=1 纯次数
+	// 模式与 OffLen<=0 任意 offset 规则。
+	if r.HealOnWrite && r.Op == OpRead && bs > 1 && r.OffLen > 0 {
+		// 按块模式：为每块分配独立治愈标志。但块数过大（OffLen 接近 MaxInt64）时 make 会 OOM，
+		// 故超 maxHealedBlocks 阈值回退整段模式（healedBlocks 留 nil，write 整段治愈、按
+		// blocksNeeded 整体扣 spare）——语义不丢，仅放弃逐块治愈粒度。
+		if n := blocksNeeded(r.OffLen, bs); n <= maxHealedBlocks {
+			s.healedBlocks = make([]bool, n)
+		}
+	}
+	in.rules = append(in.rules, s)
 	return r.ID
 }
 
@@ -170,7 +199,22 @@ func (in *Injector) List() []RuleView {
 	defer in.mu.Unlock()
 	out := make([]RuleView, len(in.rules))
 	for i, s := range in.rules {
-		out[i] = RuleView{Rule: s.r, Healed: s.healed, Remaining: s.remaining}
+		rv := RuleView{Rule: s.r, Healed: s.healed, Remaining: s.remaining}
+		if s.healedBlocks != nil {
+			rv.TotalBlocks = len(s.healedBlocks)
+			for _, b := range s.healedBlocks {
+				if b {
+					rv.HealedBlocks++
+				}
+			}
+			rv.Healed = rv.HealedBlocks == rv.TotalBlocks
+		} else if s.r.HealOnWrite {
+			rv.TotalBlocks = 1
+			if s.healed {
+				rv.HealedBlocks = 1
+			}
+		}
+		out[i] = rv
 	}
 	return out
 }
@@ -206,10 +250,13 @@ func (in *Injector) Refresh(opts RefreshOptions) RefreshResult {
 	var entries []ResetEntry
 	for i := range in.rules {
 		s := &in.rules[i]
-		before := ruleStateText(s.healed, s.remaining)
+		before := ruleStateText(s.healed, s.remaining, s.healedBlocks)
 		s.remaining = s.initialRem
 		s.healed = false
-		if after := ruleStateText(s.healed, s.remaining); before != after {
+		for j := range s.healedBlocks {
+			s.healedBlocks[j] = false
+		}
+		if after := ruleStateText(s.healed, s.remaining, s.healedBlocks); before != after {
 			entries = append(entries, ResetEntry{What: "rule", ID: s.r.ID, Before: before, After: after})
 		}
 	}
@@ -235,8 +282,18 @@ func (in *Injector) Refresh(opts RefreshOptions) RefreshResult {
 	return RefreshResult{Entries: entries}
 }
 
-// ruleStateText 把规则运行时状态格式化为紧凑串（healed=%v rem=%d）。
-func ruleStateText(healed bool, remaining int) string {
+// ruleStateText 把规则运行时状态格式化为紧凑串。按块模式输出 "healed=N/M"；整段模式
+// 输出 "healed=%v"。含 remaining。供 Refresh 的 Before/After 比较。
+func ruleStateText(healed bool, remaining int, healedBlocks []bool) string {
+	if healedBlocks != nil {
+		n := 0
+		for _, b := range healedBlocks {
+			if b {
+				n++
+			}
+		}
+		return "healed=" + strconv.Itoa(n) + "/" + strconv.Itoa(len(healedBlocks)) + " rem=" + strconv.Itoa(remaining)
+	}
 	return "healed=" + strconv.FormatBool(healed) + " rem=" + strconv.Itoa(remaining)
 }
 
@@ -283,6 +340,26 @@ func (in *Injector) SpareBlockSize() int64 {
 	return in.spareBlockSize
 }
 
+// SetCapacity 设模拟容量上限（字节）；<0 钳到 0（=未启用）。capacity 是 mount 时固化的
+// 设备属性，不被消耗、不进 Refresh（改值需重新挂载）。挂载时由 [Mount] 按 backing statfs
+// 校验 capacity∈(backing已用, backing总量)；运行时 write 超容量返 ENOSPC、statfs 反映
+// 模拟容量（见 spec/capacity.md）。0=不限制（直透 backing 真实容量）。
+func (in *Injector) SetCapacity(capacity int64) {
+	if capacity < 0 {
+		capacity = 0
+	}
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	in.capacity = capacity
+}
+
+// Capacity 返回模拟容量上限（字节）；0=未启用。
+func (in *Injector) Capacity() int64 {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	return in.capacity
+}
+
 // blocksNeeded 计算治愈一段长 offLen 字节的坏区需要消耗多少个 blockSize 字节的备用块：
 // blockSize<=1（纯次数模式）或 offLen<=0（未限定区间）时算 1 块；否则向上取整
 // （ceil(offLen/blockSize)）。真实硬盘语义：备用块按整块重映射。
@@ -301,10 +378,10 @@ func blocksNeeded(offLen, blockSize int64) int64 {
 }
 
 // Check 返回命中的 errno（0 表示放行，不注入）。op 是操作类型（取 Op* 常量），
-// path 是挂载内相对路径，off 是 read/write 的请求起始 offset（其他 op 传 -1，
-// 不会被匹配）。普通规则命中会消耗一次 N 配额；HealOnWrite 规则的治愈由 write
-// 触发（见 [Rule.HealOnWrite]）。
-func (in *Injector) Check(op, path string, off int64) syscall.Errno {
+// path 是挂载内相对路径，off/length 是 read/write 的请求起始 offset 与字节数（其他 op
+// 传 0；length 仅 HealOnWrite 按块治愈判定用，整段模式与普通规则忽略）。普通规则命中
+// 消耗一次 N 配额；HealOnWrite 规则的治愈由 write 触发（见 [Rule.HealOnWrite]）。
+func (in *Injector) Check(op, path string, off, length int64) syscall.Errno {
 	in.mu.Lock()
 	defer in.mu.Unlock()
 	for i := range in.rules {
@@ -332,27 +409,65 @@ func (in *Injector) Check(op, path string, off int64) syscall.Errno {
 			}
 		}
 
-		// HealOnWrite 坏扇区语义。
+		// HealOnWrite 坏扇区语义。整段模式（healedBlocks==nil）下 write 命中即整段治愈；
+		// 按块模式下 read/write 按"请求覆盖的块"判定——部分覆盖 write 只治愈其实际写入
+		// 的块，未覆盖块 read 仍 EIO（真硬盘 UNC 语义，避免 backing 旧数据被误读为已修复）。
 		if r.HealOnWrite && r.Op == OpRead {
 			switch op {
 			case OpRead:
-				if s.healed {
-					continue // 已修复：放行，读到重映射后数据
+				if s.healedBlocks == nil {
+					if s.healed {
+						continue // 整段已修复：放行
+					}
+					return r.Errno // 未修复：坏扇区读 → EIO
 				}
-				return r.Errno // 未修复：坏扇区读 → EIO
+				// 按块：请求覆盖的块全治愈才放行，否则 EIO（保守：跨好坏块整体 EIO）。
+				if allHealed(s.healedBlocks, r.Off, r.OffLen, off, length, s.blockSize) {
+					continue
+				}
+				return r.Errno
 			case OpWrite:
-				if s.healed {
-					continue // 已修复：放行 write
+				if s.healedBlocks == nil {
+					// 整段模式：write 命中即整段治愈，按 blocksNeeded(OffLen,blockSize) 扣 spare。
+					// blockSize<=1 或 OffLen<=0 时 blocksNeeded 返回 1（纯次数语义）；按块模式因
+					// 块数超 maxHealedBlocks 回退到此者，则按真实块数整体扣（保留"整段消耗"语义）。
+					if s.healed {
+						continue
+					}
+					need := blocksNeeded(r.OffLen, s.blockSize)
+					if in.spareCount != -1 && in.spareCount < need {
+						return r.Errno // 备用块不足：write 也 EIO
+					}
+					s.healed = true
+					if in.spareCount > 0 {
+						in.spareCount -= need
+					}
+					return 0
 				}
-				need := blocksNeeded(r.OffLen, in.spareBlockSize)
+				// 按块模式：只治愈 write 实际覆盖的块，按新治愈块数扣 spare。
+				start, end, ok := coverRange(r.Off, r.OffLen, off, length, s.blockSize, len(s.healedBlocks))
+				if !ok {
+					continue // 无交集（off 已在坏区内，理论上不触发），放行
+				}
+				var need int64
+				for j := start; j <= end; j++ {
+					if !s.healedBlocks[j] {
+						need++
+					}
+				}
+				if need == 0 {
+					return 0 // 覆盖块已全治愈，放行
+				}
 				if in.spareCount != -1 && in.spareCount < need {
-					return r.Errno // 备用块不足：write 也 EIO
+					return r.Errno // 备用块不足：不治愈任何块（原子），write 也 EIO
 				}
-				s.healed = true // 备用块重映射，治愈
+				for j := start; j <= end; j++ {
+					s.healedBlocks[j] = true
+				}
 				if in.spareCount > 0 {
-					in.spareCount -= need // 整块消耗（-1 无限时不计）
+					in.spareCount -= need // 按新治愈块数整块消耗（-1 无限时不计）
 				}
-				return 0 // 放行 write
+				return 0
 			}
 		}
 
@@ -366,4 +481,51 @@ func (in *Injector) Check(op, path string, off int64) syscall.Errno {
 		return r.Errno
 	}
 	return 0
+}
+
+// coverRange 计算请求 [off,off+length) 与坏区 [rOff, rOff+rLen) 的交集，映射到坏区内的
+// 块下标 [start, end]（块 i 覆盖 [rOff+i*bs, rOff+(i+1)*bs)）。ok=false 表示无交集
+// （length<=0、bs<=1 或区间不相交）。供 HealOnWrite 按块治愈判定。
+func coverRange(rOff, rLen, off, length, bs int64, nBlocks int) (start, end int64, ok bool) {
+	if bs <= 1 || length <= 0 {
+		return 0, 0, false
+	}
+	lo := off
+	if rOff > lo {
+		lo = rOff
+	}
+	hi := off + length
+	if regionEnd := rOff + rLen; regionEnd < hi {
+		hi = regionEnd
+	}
+	if hi <= lo {
+		return 0, 0, false
+	}
+	start = (lo - rOff) / bs
+	end = (hi - 1 - rOff) / bs
+	if start < 0 {
+		start = 0
+	}
+	if max := int64(nBlocks) - 1; end > max {
+		end = max
+	}
+	if start > end {
+		return 0, 0, false
+	}
+	return start, end, true
+}
+
+// allHealed 报告请求 [off,off+length) 覆盖的坏区块是否全部治愈。无交集（请求未触碰
+// 坏区）返回 true（放行）。
+func allHealed(blocks []bool, rOff, rLen, off, length, bs int64) bool {
+	start, end, ok := coverRange(rOff, rLen, off, length, bs, len(blocks))
+	if !ok {
+		return true
+	}
+	for i := start; i <= end; i++ {
+		if !blocks[i] {
+			return false
+		}
+	}
+	return true
 }

@@ -48,16 +48,18 @@ type Req struct {
 
 // RuleView 是 list-rules / status 返回的单条规则视图（含运行时状态）。
 type RuleView struct {
-	ID          int    `json:"id"`
-	Op          string `json:"op"`
-	Path        string `json:"path,omitempty"`
-	Off         int64  `json:"off,omitempty"`
-	OffLen      int64  `json:"off_len,omitempty"`
-	Errno       int    `json:"errno"`
-	N           int    `json:"n,omitempty"`
-	HealOnWrite bool   `json:"heal_on_write,omitempty"`
-	Healed      bool   `json:"healed,omitempty"`
-	Remaining   int    `json:"remaining"`
+	ID           int    `json:"id"`
+	Op           string `json:"op"`
+	Path         string `json:"path,omitempty"`
+	Off          int64  `json:"off,omitempty"`
+	OffLen       int64  `json:"off_len,omitempty"`
+	Errno        int    `json:"errno"`
+	N            int    `json:"n,omitempty"`
+	HealOnWrite  bool   `json:"heal_on_write,omitempty"`
+	Healed       bool   `json:"healed,omitempty"`
+	HealedBlocks int    `json:"healed_blocks,omitempty"` // HealOnWrite 按块模式：已治愈块数
+	TotalBlocks  int    `json:"total_blocks,omitempty"`  // HealOnWrite 按块模式：总块数
+	Remaining    int    `json:"remaining"`
 }
 
 // ResetView 是 refresh 返回的单条复位/变动条目（faultfs.ResetEntry 的协议投影）。
@@ -80,6 +82,7 @@ type Resp struct {
 	Speed          float64     `json:"speed,omitempty"`            // status / dump
 	Spare          int64       `json:"spare,omitempty"`            // status / dump：剩余备用块数（-1 无限）
 	SpareBlockSize int64       `json:"spare_block_size,omitempty"` // status / dump：每块字节数（0→1）
+	Capacity       int64       `json:"capacity,omitempty"`         // status / dump：模拟容量上限（字节）；0=未启用
 	Resets         []ResetView `json:"resets,omitempty"`           // refresh：发生变动的条目列表
 	Dump           *DumpView   `json:"dump,omitempty"`             // dump：全量快照
 }
@@ -97,5 +100,6 @@ type DumpView struct {
 	Speed          float64           `json:"speed"`            // 全局倍速
 	Spare          int64             `json:"spare"`            // 备用块数（-1 无限）
 	SpareBlockSize int64             `json:"spare_block_size"` // 每块字节数（0→1）
+	Capacity       int64             `json:"capacity"`         // 模拟容量上限（字节）；0=未启用
 	ProfileFields  map[string]string `json:"profile_fields"`   // 完整 LatencyProfile 各字段名→值
 }

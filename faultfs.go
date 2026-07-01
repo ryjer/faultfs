@@ -22,7 +22,8 @@ import (
 // 模拟设备响应时间。
 type FaultNode struct {
 	*fs.LoopbackNode
-	inj *Injector
+	inj     *Injector
+	backing string // backing 目录绝对路径，传给 FaultFile 供容量判定、Statfs 反映容量
 }
 
 // 静态断言：确保覆写的方法签名与 go-fuse fs 接口严格一致——签名写错不会
@@ -53,7 +54,7 @@ func (n *FaultNode) WrapChild(ctx context.Context, ops fs.InodeEmbedder) fs.Inod
 	case *FaultNode:
 		return v
 	case *fs.LoopbackNode:
-		return &FaultNode{LoopbackNode: v, inj: n.inj}
+		return &FaultNode{LoopbackNode: v, inj: n.inj, backing: n.backing}
 	}
 	return ops
 }
@@ -70,7 +71,7 @@ func (n *FaultNode) rel() string {
 // FOPEN_DIRECT_IO：禁用内核 page cache，确保每次 read/write 都进入 faultfs。
 func (n *FaultNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
 	n.inj.DelayOp(OpOpen)
-	if e := n.inj.Check(OpOpen, n.rel(), -1); e != 0 {
+	if e := n.inj.Check(OpOpen, n.rel(), -1, 0); e != 0 {
 		return nil, 0, e
 	}
 	fh, fuseFlags, errno := n.LoopbackNode.Open(ctx, flags)
@@ -79,7 +80,7 @@ func (n *FaultNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint
 		return nil, 0, errno
 	}
 	if lf, ok := fh.(*fs.LoopbackFile); ok {
-		return &FaultFile{LoopbackFile: lf, inj: n.inj, path: n.rel()}, fuseFlags, 0
+		return &FaultFile{LoopbackFile: lf, inj: n.inj, path: n.rel(), backing: n.backing}, fuseFlags, 0
 	}
 	return fh, fuseFlags, 0
 }
@@ -88,7 +89,7 @@ func (n *FaultNode) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint
 func (n *FaultNode) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
 	rel := filepath.Join(n.rel(), name)
 	n.inj.DelayOp(OpCreate)
-	if e := n.inj.Check(OpCreate, rel, -1); e != 0 {
+	if e := n.inj.Check(OpCreate, rel, -1, 0); e != 0 {
 		return nil, nil, 0, e
 	}
 	inode, fh, fuseFlags, errno := n.LoopbackNode.Create(ctx, name, flags, mode, out)
@@ -97,14 +98,14 @@ func (n *FaultNode) Create(ctx context.Context, name string, flags uint32, mode 
 		return nil, nil, 0, errno
 	}
 	if lf, ok := fh.(*fs.LoopbackFile); ok {
-		return inode, &FaultFile{LoopbackFile: lf, inj: n.inj, path: rel}, fuseFlags, 0
+		return inode, &FaultFile{LoopbackFile: lf, inj: n.inj, path: rel, backing: n.backing}, fuseFlags, 0
 	}
 	return inode, fh, fuseFlags, 0
 }
 
 func (n *FaultNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	n.inj.DelayOp(OpGetattr)
-	if e := n.inj.Check(OpGetattr, n.rel(), -1); e != 0 {
+	if e := n.inj.Check(OpGetattr, n.rel(), -1, 0); e != 0 {
 		return e
 	}
 	return n.LoopbackNode.Getattr(ctx, f, out)
@@ -112,7 +113,7 @@ func (n *FaultNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.Attr
 
 func (n *FaultNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
 	n.inj.DelayOp(OpSetattr)
-	if e := n.inj.Check(OpSetattr, n.rel(), -1); e != 0 {
+	if e := n.inj.Check(OpSetattr, n.rel(), -1, 0); e != 0 {
 		return e
 	}
 	return n.LoopbackNode.Setattr(ctx, f, in, out)
@@ -120,17 +121,23 @@ func (n *FaultNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAt
 
 func (n *FaultNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 	n.inj.DelayOp(OpStatfs)
-	if e := n.inj.Check(OpStatfs, n.rel(), -1); e != 0 {
+	if e := n.inj.Check(OpStatfs, n.rel(), -1, 0); e != 0 {
 		return e
 	}
-	return n.LoopbackNode.Statfs(ctx, out)
+	errno := n.LoopbackNode.Statfs(ctx, out)
+	// 模拟容量反映：若设了 capacity，把 total 改为 capacity、avail 改为 capacity-backing真实used，
+	// 让 df/上层 statfs 看到模拟容量。used 取 backing 真实（Statfs 已填入 out）。
+	if capacity := n.inj.Capacity(); capacity > 0 && errno == 0 {
+		reflectCapacity(out, capacity)
+	}
+	return errno
 }
 
 // ---- xattr ----
 
 func (n *FaultNode) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
 	n.inj.DelayOp(OpGetxattr)
-	if e := n.inj.Check(OpGetxattr, n.rel(), -1); e != 0 {
+	if e := n.inj.Check(OpGetxattr, n.rel(), -1, 0); e != 0 {
 		return 0, e
 	}
 	return n.LoopbackNode.Getxattr(ctx, attr, dest)
@@ -138,7 +145,7 @@ func (n *FaultNode) Getxattr(ctx context.Context, attr string, dest []byte) (uin
 
 func (n *FaultNode) Setxattr(ctx context.Context, attr string, data []byte, flags uint32) syscall.Errno {
 	n.inj.DelayOp(OpSetxattr)
-	if e := n.inj.Check(OpSetxattr, n.rel(), -1); e != 0 {
+	if e := n.inj.Check(OpSetxattr, n.rel(), -1, 0); e != 0 {
 		return e
 	}
 	return n.LoopbackNode.Setxattr(ctx, attr, data, flags)
@@ -146,7 +153,7 @@ func (n *FaultNode) Setxattr(ctx context.Context, attr string, data []byte, flag
 
 func (n *FaultNode) Removexattr(ctx context.Context, attr string) syscall.Errno {
 	n.inj.DelayOp(OpRemovexattr)
-	if e := n.inj.Check(OpRemovexattr, n.rel(), -1); e != 0 {
+	if e := n.inj.Check(OpRemovexattr, n.rel(), -1, 0); e != 0 {
 		return e
 	}
 	return n.LoopbackNode.Removexattr(ctx, attr)
@@ -154,7 +161,7 @@ func (n *FaultNode) Removexattr(ctx context.Context, attr string) syscall.Errno 
 
 func (n *FaultNode) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.Errno) {
 	n.inj.DelayOp(OpListxattr)
-	if e := n.inj.Check(OpListxattr, n.rel(), -1); e != 0 {
+	if e := n.inj.Check(OpListxattr, n.rel(), -1, 0); e != 0 {
 		return 0, e
 	}
 	return n.LoopbackNode.Listxattr(ctx, dest)
@@ -164,7 +171,7 @@ func (n *FaultNode) Listxattr(ctx context.Context, dest []byte) (uint32, syscall
 
 func (n *FaultNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	n.inj.DelayOp(OpLookup)
-	if e := n.inj.Check(OpLookup, filepath.Join(n.rel(), name), -1); e != 0 {
+	if e := n.inj.Check(OpLookup, filepath.Join(n.rel(), name), -1, 0); e != 0 {
 		return nil, e
 	}
 	return n.LoopbackNode.Lookup(ctx, name, out)
@@ -172,7 +179,7 @@ func (n *FaultNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut)
 
 func (n *FaultNode) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	n.inj.DelayOp(OpMkdir)
-	if e := n.inj.Check(OpMkdir, filepath.Join(n.rel(), name), -1); e != 0 {
+	if e := n.inj.Check(OpMkdir, filepath.Join(n.rel(), name), -1, 0); e != 0 {
 		return nil, e
 	}
 	return n.LoopbackNode.Mkdir(ctx, name, mode, out)
@@ -180,7 +187,7 @@ func (n *FaultNode) Mkdir(ctx context.Context, name string, mode uint32, out *fu
 
 func (n *FaultNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 	n.inj.DelayOp(OpRmdir)
-	if e := n.inj.Check(OpRmdir, filepath.Join(n.rel(), name), -1); e != 0 {
+	if e := n.inj.Check(OpRmdir, filepath.Join(n.rel(), name), -1, 0); e != 0 {
 		return e
 	}
 	return n.LoopbackNode.Rmdir(ctx, name)
@@ -188,7 +195,7 @@ func (n *FaultNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 
 func (n *FaultNode) Unlink(ctx context.Context, name string) syscall.Errno {
 	n.inj.DelayOp(OpUnlink)
-	if e := n.inj.Check(OpUnlink, filepath.Join(n.rel(), name), -1); e != 0 {
+	if e := n.inj.Check(OpUnlink, filepath.Join(n.rel(), name), -1, 0); e != 0 {
 		return e
 	}
 	return n.LoopbackNode.Unlink(ctx, name)
@@ -196,14 +203,14 @@ func (n *FaultNode) Unlink(ctx context.Context, name string) syscall.Errno {
 
 func (n *FaultNode) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
 	n.inj.DelayOp(OpRename)
-	if e := n.inj.Check(OpRename, filepath.Join(n.rel(), name), -1); e != 0 {
+	if e := n.inj.Check(OpRename, filepath.Join(n.rel(), name), -1, 0); e != 0 {
 		return e
 	}
 	return n.LoopbackNode.Rename(ctx, name, newParent, newName, flags)
 }
 func (n *FaultNode) Fsync(ctx context.Context, f fs.FileHandle, flags uint32) syscall.Errno {
 	n.inj.DelayOp(OpFsync)
-	if e := n.inj.Check(OpFsync, n.rel(), -1); e != 0 {
+	if e := n.inj.Check(OpFsync, n.rel(), -1, 0); e != 0 {
 		return e
 	}
 	if fh, ok := f.(*FaultFile); ok {
@@ -214,7 +221,7 @@ func (n *FaultNode) Fsync(ctx context.Context, f fs.FileHandle, flags uint32) sy
 
 func (n *FaultNode) Flush(ctx context.Context, f fs.FileHandle) syscall.Errno {
 	n.inj.DelayOp(OpFlush)
-	if e := n.inj.Check(OpFlush, n.rel(), -1); e != 0 {
+	if e := n.inj.Check(OpFlush, n.rel(), -1, 0); e != 0 {
 		return e
 	}
 	if fh, ok := f.(*FaultFile); ok {
@@ -236,7 +243,7 @@ func newRoot(backing string, inj *Injector) (fs.InodeEmbedder, error) {
 		Dev:  uint64(st.Dev),
 	}
 	lb := &fs.LoopbackNode{RootData: root}
-	r := &FaultNode{LoopbackNode: lb, inj: inj}
+	r := &FaultNode{LoopbackNode: lb, inj: inj, backing: backing}
 	root.RootNode = r
 	return r, nil
 }
@@ -277,6 +284,9 @@ func Run(mp, backing string, inj *Injector) error {
 // 与 Run（CLI 守护）共用它。control 监听失败不阻断挂载（cleanup 里 ctl.Close
 // 对未 Listen 的 server 是 no-op）。
 func mountInternal(mp, backing string, inj *Injector) (*fuse.Server, func(), error) {
+	if err := checkCapacityAtMount(backing, inj.Capacity()); err != nil {
+		return nil, nil, err
+	}
 	root, err := newRoot(backing, inj)
 	if err != nil {
 		return nil, nil, err
@@ -308,6 +318,51 @@ func mountInternal(mp, backing string, inj *Injector) (*fuse.Server, func(), err
 		}
 	}
 	return server, cleanup, nil
+}
+
+// checkCapacityAtMount 在挂载时校验模拟容量 capacity 落在合法区间：必须 > backing 已用、
+// 且 < backing 总量（等价 capacity-已用 < 剩余）。前者避免挂载即满，后者保证 faultfs 模拟的
+// "满"先于 backing 真满触发——这是用 capacity 模拟 ENOSPC 的前提。capacity<=0（未启用）跳过。
+func checkCapacityAtMount(backing string, capacity int64) error {
+	if capacity <= 0 {
+		return nil
+	}
+	var sf syscall.Statfs_t
+	if err := syscall.Statfs(backing, &sf); err != nil {
+		return fmt.Errorf("capacity 校验：statfs %s: %w", backing, err)
+	}
+	bsize := int64(sf.Bsize)
+	used := (int64(sf.Blocks) - int64(sf.Bfree)) * bsize
+	total := int64(sf.Blocks) * bsize
+	if capacity <= used {
+		return fmt.Errorf("capacity %s ≤ backing 已用 %s；挂载即满，无法模拟（capacity 须 > backing 已用）", FormatSize(capacity), FormatSize(used))
+	}
+	if capacity >= total {
+		return fmt.Errorf("capacity %s ≥ backing 总量 %s；无法保证 faultfs 模拟的满先于 backing 真满（capacity 须 < backing 总量）", FormatSize(capacity), FormatSize(total))
+	}
+	return nil
+}
+
+// reflectCapacity 把 statfs 输出改写为基于模拟容量：total = capacity、avail = capacity -
+// backing真实used（used 从 out 已填的 backing 真实值推算）。让 df/上层 statfs 看到模拟容量，
+// 同时保留 backing 的块大小与真实已用量。供 [FaultNode.Statfs] 在设了 capacity 时调用。
+func reflectCapacity(out *fuse.StatfsOut, capacity int64) {
+	frsize := int64(out.Bsize)
+	if frsize <= 0 {
+		frsize = 1
+	}
+	usedBlocks := int64(out.Blocks) - int64(out.Bfree)
+	if usedBlocks < 0 {
+		usedBlocks = 0
+	}
+	total := capacity / frsize
+	avail := total - usedBlocks
+	if avail < 0 {
+		avail = 0
+	}
+	out.Blocks = uint64(total)
+	out.Bfree = uint64(avail)
+	out.Bavail = uint64(avail)
 }
 
 // MountT 是测试友好的挂载入口：自动创建 backing 临时目录与挂载点、把卸载注册
@@ -369,7 +424,7 @@ func handleControl(inj *Injector, meta mountMeta, req control.Req) control.Resp 
 		inj.SetSpareBlocks(req.Spare, req.SpareBlockSize) // blockSize<1 与 count<-1 由 SetSpareBlocks 统一钳制（单一真实来源）
 		return control.Resp{OK: true}
 	case control.CmdStatus:
-		return control.Resp{OK: true, Rules: toControlViews(inj.List()), Profile: profileName(inj.Profile()), Spare: inj.Spare(), SpareBlockSize: inj.SpareBlockSize(), Speed: inj.Speed()}
+		return control.Resp{OK: true, Rules: toControlViews(inj.List()), Profile: profileName(inj.Profile()), Spare: inj.Spare(), SpareBlockSize: inj.SpareBlockSize(), Capacity: inj.Capacity(), Speed: inj.Speed()}
 	case control.CmdDump:
 		return control.Resp{OK: true, Dump: buildDump(inj, meta)}
 	}
@@ -456,6 +511,7 @@ func buildDump(inj *Injector, meta mountMeta) *control.DumpView {
 		Speed:          inj.Speed(),
 		Spare:          inj.Spare(),
 		SpareBlockSize: inj.SpareBlockSize(),
+		Capacity:       inj.Capacity(),
 		ProfileFields:  profileFields(p),
 	}
 }
@@ -465,16 +521,18 @@ func toControlViews(vs []RuleView) []control.RuleView {
 	out := make([]control.RuleView, len(vs))
 	for i, v := range vs {
 		out[i] = control.RuleView{
-			ID:          v.ID,
-			Op:          v.Op,
-			Path:        v.Path,
-			Off:         v.Off,
-			OffLen:      v.OffLen,
-			Errno:       int(v.Errno),
-			N:           v.N,
-			HealOnWrite: v.HealOnWrite,
-			Healed:      v.Healed,
-			Remaining:   v.Remaining,
+			ID:           v.ID,
+			Op:           v.Op,
+			Path:         v.Path,
+			Off:          v.Off,
+			OffLen:       v.OffLen,
+			Errno:        int(v.Errno),
+			N:            v.N,
+			HealOnWrite:  v.HealOnWrite,
+			Healed:       v.Healed,
+			HealedBlocks: v.HealedBlocks,
+			TotalBlocks:  v.TotalBlocks,
+			Remaining:    v.Remaining,
 		}
 	}
 	return out

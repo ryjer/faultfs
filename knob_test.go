@@ -2,6 +2,7 @@ package faultfs
 
 import (
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -123,36 +124,49 @@ func TestProfileFromKnobs(t *testing.T) {
 }
 
 func TestAdjustProfileClamps(t *testing.T) {
-	// 目标慢于 backing：不钳、不告警。
+	// 新语义：rand 是叠加增量（不减 backing、不告警）；seq 是限制上限（目标带宽 > backing 时钳到 backing 并告警）。
 	target := ProfileFromKnobs(8*time.Millisecond, 100*MiB)
 	adj, warns := AdjustProfile(target, 1*time.Microsecond, 5*GiB)
 	if len(warns) != 0 {
-		t.Errorf("目标慢于 backing 不应告警，得 %v", warns)
+		t.Errorf("rand 增量 + seq 慢于 backing 不应告警，得 %v", warns)
 	}
-	// 8ms - 1µs ≈ 7.999ms
-	if adj.ReadRand >= 8*time.Millisecond || adj.ReadRand < 7*time.Millisecond {
-		t.Errorf("ReadRand 钳制异常：%v", adj.ReadRand)
+	// rand 透传不减 backing（增量语义）。
+	if adj.ReadRand != 8*time.Millisecond || adj.WriteRand != 8*time.Millisecond {
+		t.Errorf("ReadRand/WriteRand 应透传不减 backing：%v/%v", adj.ReadRand, adj.WriteRand)
 	}
-	// per-byte: target(100MiB→9.5ns) - backing(5GiB→0.19ns) ≈ 9.3ns，仍 >0
+	// 元数据 op（由 rand 派生）也不减 backing。
+	if adj.Open != 8*time.Millisecond {
+		t.Errorf("Open 应透传不减 backing：%v", adj.Open)
+	}
+	// seq 限制：想限到 100MiB/s（per-byte 9.5ns），backing 能 5GiB/s（0.19ns），sleep = 9.5-0.19 ≈ 9.3ns >0。
 	if adj.ReadByte <= 0 {
 		t.Errorf("ReadByte 不应被钳到 0：%v", adj.ReadByte)
 	}
 
-	// 目标快于 backing：钳到 0 并告警。
-	fast := ProfileFromKnobs(1*time.Nanosecond, 100*GiB) // 1ns rand, 100GiB/s
-	adj2, warns2 := AdjustProfile(fast, 1*time.Microsecond, 1*GiB)
-	if len(warns2) == 0 {
-		t.Errorf("目标快于 backing 应告警")
+	// seq 目标带宽 > backing（想限到的速度比 backing 还快）：rand 仍透传，seq 钳到 backing 并告警。
+	// 用 ≤1GiB/s 量级带宽（per-byte ≥1ns 可精确表达）；>1GiB/s 的 per-byte <1ns 会被量化为 0。
+	fast := ProfileFromKnobs(1*time.Nanosecond, 500*MiB) // rand=1ns 增量，seq=500MiB/s（快于 backing 100MiB/s）
+	adj2, warns2 := AdjustProfile(fast, 1*time.Microsecond, 100*MiB)
+	// rand 1ns 增量合法，透传不减、不告警。
+	if adj2.ReadRand != 1*time.Nanosecond {
+		t.Errorf("rand 增量应透传不减 backing：%v", adj2.ReadRand)
 	}
-	if adj2.ReadRand != 0 {
-		t.Errorf("ReadRand 应钳到 0（目标快于 backing）：%v", adj2.ReadRand)
-	}
+	// seq 100GiB > backing 1GiB → 钳到 0（实际取 backing）并告警。
 	if adj2.ReadByte != 0 {
 		t.Errorf("ReadByte 应钳到 0（目标带宽超出 backing）：%v", adj2.ReadByte)
 	}
+	if len(warns2) == 0 {
+		t.Errorf("seq 目标快于 backing 应告警")
+	}
+	// 告警只来自 seq（rand 是增量，永不告警）。
+	for _, w := range warns2 {
+		if strings.Contains(w, "随机") {
+			t.Errorf("rand 增量不应告警，得 %q", w)
+		}
+	}
 
-	// backing 未校准（measured<=0）：透传不钳。
-	adj3, warns3 := AdjustProfile(target, 0, 0)
+	// backing 未校准（measuredBw<=0）：seq 透传不钳；rand 透传。
+	adj3, warns3 := AdjustProfile(target, 1*time.Microsecond, 0)
 	if len(warns3) != 0 || adj3.ReadRand != target.ReadRand {
 		t.Errorf("未校准应透传不钳：%v / %v", warns3, adj3.ReadRand)
 	}
@@ -254,26 +268,47 @@ func TestFormatSpeedFractional(t *testing.T) {
 	}
 }
 
-// TestAdjustProfileClampsMetadata:元数据 op 由 rand 派生（见 applyRandLatency），
-// --rand 快于 backing 时应一并钳到 0；慢于 backing 时减去 backing 贡献且不告警。
+// TestAdjustProfileClampsMetadata:元数据 op 由 rand 派生（见 applyRandLatency）。新语义下
+// rand 是叠加增量，元数据 op 也透传不减 backing（不再"快于 backing 时钳到 0"）。
 func TestAdjustProfileClampsMetadata(t *testing.T) {
-	fast := ProfileFromKnobs(1*time.Nanosecond, 0) // rand=1ns，快于 backing
+	fast := ProfileFromKnobs(1*time.Nanosecond, 0) // rand=1ns 增量
 	adj, _ := AdjustProfile(fast, 1*time.Microsecond, 0)
+	// rand 1ns 增量合法，元数据 op = 1ns（不减 backing，不钳到 0）。
 	for name, d := range map[string]time.Duration{
 		"Open": adj.Open, "Getattr": adj.Getattr, "Create": adj.Create, "Statfs": adj.Statfs,
 	} {
-		if d != 0 {
-			t.Errorf("%s 应钳到 0（rand 派生、快于 backing）：%v", name, d)
+		if d != 1*time.Nanosecond {
+			t.Errorf("%s 应透传 rand 增量 1ns（不减 backing）：%v", name, d)
 		}
 	}
 
 	slow := ProfileFromKnobs(8*time.Millisecond, 0)
 	adj2, warns := AdjustProfile(slow, 1*time.Microsecond, 0)
-	if adj2.Open != 8*time.Millisecond-1*time.Microsecond {
-		t.Errorf("Open 应为 8ms-1µs（减去 backing 贡献）：%v", adj2.Open)
+	if adj2.Open != 8*time.Millisecond {
+		t.Errorf("Open 应透传 8ms 增量（不减 backing）：%v", adj2.Open)
 	}
 	if len(warns) != 0 {
-		t.Errorf("目标慢于 backing 不应告警：%v", warns)
+		t.Errorf("rand 增量不应告警：%v", warns)
+	}
+}
+
+// TestSetProfileCalibratedRandOnlySkipsCalib:rand-only profile（无带宽字段）跳过 backing 校准，
+// 直接写入、无告警（rand 是叠加增量，不需 backing 上限来判定）。
+func TestSetProfileCalibratedRandOnlySkipsCalib(t *testing.T) {
+	inj := NewInjector()
+	backing := t.TempDir()
+	target := ProfileFromKnobs(8*time.Millisecond, 0) // rand-only
+	warns := inj.SetProfileCalibrated(backing, target)
+	if len(warns) != 0 {
+		t.Errorf("rand-only 不校准、不应告警：%v", warns)
+	}
+	p := inj.Profile()
+	if p.ReadRand != 8*time.Millisecond {
+		t.Errorf("ReadRand = %v, want 8ms（增量透传）", p.ReadRand)
+	}
+	// 未触发 backing 校准（CalibratedFloor 未就绪）。
+	if _, _, ok := inj.CalibratedFloor(); ok {
+		t.Errorf("rand-only 不应触发 backing 校准")
 	}
 }
 
@@ -368,5 +403,41 @@ func TestFormatSpareSize(t *testing.T) {
 	}
 	if s := FormatSpare(4, 1); s != "4" {
 		t.Errorf("FormatSpare(4,1)=%q want 4", s)
+	}
+}
+
+// TestParseCapacity:容量字符串解析（单位/裸数字/负值/非法）。
+func TestParseCapacity(t *testing.T) {
+	cases := []struct {
+		in   string
+		want int64
+	}{
+		{"100M", int64(100 * MiB)},
+		{"1G", int64(1 * GiB)},
+		{"100MiB", int64(100 * MiB)},
+		{"2GiB", int64(2 * GiB)},
+		{"512K", 512 * 1024},
+		{"1000", 1000}, // 裸数字 → 字节
+		{"0", 0},
+	}
+	for _, c := range cases {
+		got, err := ParseCapacity(c.in)
+		if err != nil {
+			t.Errorf("ParseCapacity(%q) err=%v", c.in, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("ParseCapacity(%q)=%d want %d", c.in, got, c.want)
+		}
+	}
+	for _, bad := range []string{"", "abc", "-100M", "8Z"} {
+		if _, err := ParseCapacity(bad); err == nil {
+			t.Errorf("ParseCapacity(%q) 期望失败，却成功", bad)
+		}
+	}
+	if _, err := ParseCapacity(""); err == nil {
+		t.Fatal("ParseCapacity(\"\") 期望失败")
+	} else if _, ok := err.(*knobParseError); !ok {
+		t.Errorf("ParseCapacity 非法应返回 *knobParseError，得 %T", err)
 	}
 }

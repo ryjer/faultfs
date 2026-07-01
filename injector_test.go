@@ -14,13 +14,13 @@ func TestHealOnWrite_ReadEIOThenWriteHeals(t *testing.T) {
 	inj.SetSpare(-1) // 默认 spare=0（不可治愈）；这里需无限预算以验证治愈语义
 	inj.Add(Rule{Op: OpRead, Path: "f", Errno: syscall.EIO, HealOnWrite: true})
 
-	if e := inj.Check(OpRead, "f", 0); e != syscall.EIO {
+	if e := inj.Check(OpRead, "f", 0, 1); e != syscall.EIO {
 		t.Fatalf("first read = %v, want EIO", e)
 	}
-	if e := inj.Check(OpWrite, "f", 0); e != 0 {
+	if e := inj.Check(OpWrite, "f", 0, 1); e != 0 {
 		t.Fatalf("write after bad sector = %v, want 0 (healed)", e)
 	}
-	if e := inj.Check(OpRead, "f", 0); e != 0 {
+	if e := inj.Check(OpRead, "f", 0, 1); e != 0 {
 		t.Fatalf("read after heal = %v, want 0", e)
 	}
 }
@@ -30,13 +30,13 @@ func TestHealOnWrite_RefreshResets(t *testing.T) {
 	inj := NewInjector()
 	inj.SetSpare(-1) // 默认 spare=0；这里需无限预算以验证治愈→重置语义
 	inj.Add(Rule{Op: OpRead, Path: "f", Errno: syscall.EIO, HealOnWrite: true})
-	inj.Check(OpRead, "f", 0)
-	inj.Check(OpWrite, "f", 0) // 治愈
-	if e := inj.Check(OpRead, "f", 0); e != 0 {
+	inj.Check(OpRead, "f", 0, 1)
+	inj.Check(OpWrite, "f", 0, 1) // 治愈
+	if e := inj.Check(OpRead, "f", 0, 1); e != 0 {
 		t.Fatal("should be healed before refresh")
 	}
 	inj.Refresh(RefreshOptions{})
-	if e := inj.Check(OpRead, "f", 0); e != syscall.EIO {
+	if e := inj.Check(OpRead, "f", 0, 1); e != syscall.EIO {
 		t.Fatalf("after Refresh read = %v, want EIO again", e)
 	}
 }
@@ -47,11 +47,11 @@ func TestHealOnWrite_SpareExhausted(t *testing.T) {
 	inj := NewInjector()
 	inj.SetSpare(0)
 	inj.Add(Rule{Op: OpRead, Path: "f", Errno: syscall.EIO, HealOnWrite: true})
-	if e := inj.Check(OpWrite, "f", 0); e != syscall.EIO {
+	if e := inj.Check(OpWrite, "f", 0, 1); e != syscall.EIO {
 		t.Fatalf("write with spare=0 = %v, want EIO", e)
 	}
 	inj.SetSpare(1)
-	if e := inj.Check(OpWrite, "f", 0); e != 0 {
+	if e := inj.Check(OpWrite, "f", 0, 1); e != 0 {
 		t.Fatalf("write with spare=1 = %v, want 0 (healed)", e)
 	}
 }
@@ -62,13 +62,13 @@ func TestSpareDecrements(t *testing.T) {
 	inj.SetSpare(2)
 	inj.Add(Rule{Op: OpRead, Path: "a", Errno: syscall.EIO, HealOnWrite: true})
 	inj.Add(Rule{Op: OpRead, Path: "b", Errno: syscall.EIO, HealOnWrite: true})
-	inj.Check(OpWrite, "a", 0)
-	inj.Check(OpWrite, "b", 0)
+	inj.Check(OpWrite, "a", 0, 1)
+	inj.Check(OpWrite, "b", 0, 1)
 	if got := inj.Spare(); got != 0 {
 		t.Fatalf("spare = %d, want 0 after 2 heals", got)
 	}
 	inj.Add(Rule{Op: OpRead, Path: "c", Errno: syscall.EIO, HealOnWrite: true})
-	if e := inj.Check(OpWrite, "c", 0); e != syscall.EIO {
+	if e := inj.Check(OpWrite, "c", 0, 1); e != syscall.EIO {
 		t.Fatalf("write c with spare=0 = %v, want EIO", e)
 	}
 	// Refresh 还原 spare 到初始 2，c 规则也回到未治愈 → 又能治愈。
@@ -76,7 +76,7 @@ func TestSpareDecrements(t *testing.T) {
 	if got := inj.Spare(); got != 2 {
 		t.Fatalf("spare after Refresh = %d, want 2", got)
 	}
-	if e := inj.Check(OpWrite, "c", 0); e != 0 {
+	if e := inj.Check(OpWrite, "c", 0, 1); e != 0 {
 		t.Fatalf("write c after Refresh = %v, want 0 (healed)", e)
 	}
 }
@@ -98,7 +98,7 @@ func TestAddDeleteListClear(t *testing.T) {
 	if len(inj.List()) != 1 {
 		t.Fatalf("after delete len = %d want 1", len(inj.List()))
 	}
-	if e := inj.Check(OpWrite, "b", 0); e != syscall.ENOSPC {
+	if e := inj.Check(OpWrite, "b", 0, 1); e != syscall.ENOSPC {
 		t.Fatalf("id2 should still fire, got %v", e)
 	}
 	if inj.Delete(999) {
@@ -119,7 +119,7 @@ func TestCheckConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			inj.Check(OpRead, "f", int64(i))
+			inj.Check(OpRead, "f", int64(i), 1)
 		}(i)
 	}
 	wg.Add(1)
@@ -149,7 +149,7 @@ func TestSpareBlocks(t *testing.T) {
 	}
 	// 坏区 8192 → ceil(8192/4096)=2 块。
 	inj.Add(Rule{Op: OpRead, Path: "big", Off: 0, OffLen: 8192, Errno: syscall.EIO, HealOnWrite: true})
-	if e := inj.Check(OpWrite, "big", 0); e != 0 {
+	if e := inj.Check(OpWrite, "big", 0, 8192); e != 0 { // 覆盖整个 8192 坏区 → 治愈 2 块
 		t.Fatalf("heal big = %v, want 0", e)
 	}
 	if got := inj.Spare(); got != 6 {
@@ -157,7 +157,7 @@ func TestSpareBlocks(t *testing.T) {
 	}
 	// 坏区 100 → ceil(100/4096)=1 块（向上取整，最小 1）。
 	inj.Add(Rule{Op: OpRead, Path: "tiny", Off: 0, OffLen: 100, Errno: syscall.EIO, HealOnWrite: true})
-	if e := inj.Check(OpWrite, "tiny", 0); e != 0 {
+	if e := inj.Check(OpWrite, "tiny", 0, 100); e != 0 { // 覆盖 100B 坏区 → 1 块
 		t.Fatalf("heal tiny = %v, want 0", e)
 	}
 	if got := inj.Spare(); got != 5 {
@@ -167,7 +167,7 @@ func TestSpareBlocks(t *testing.T) {
 	inj2 := NewInjector()
 	inj2.SetSpareBlocks(-1, 4096)
 	inj2.Add(Rule{Op: OpRead, Path: "x", Off: 0, OffLen: 1 << 20, Errno: syscall.EIO, HealOnWrite: true})
-	if e := inj2.Check(OpWrite, "x", 0); e != 0 {
+	if e := inj2.Check(OpWrite, "x", 0, 4096); e != 0 { // 无限 spare：覆盖 1 块即治愈，不计
 		t.Fatalf("unlimited spare heal = %v, want 0", e)
 	}
 	if got := inj2.Spare(); got != -1 {
@@ -181,7 +181,7 @@ func TestSpareBlocksExhausted(t *testing.T) {
 	inj.SetSpareBlocks(1, 4096) // 仅 1 块
 	// 坏区 8192 需 2 块 > 1 → write EIO、spare 不变。
 	inj.Add(Rule{Op: OpRead, Path: "f", Off: 0, OffLen: 8192, Errno: syscall.EIO, HealOnWrite: true})
-	if e := inj.Check(OpWrite, "f", 0); e != syscall.EIO {
+	if e := inj.Check(OpWrite, "f", 0, 8192); e != syscall.EIO { // 需 2 块 > 1 spare → EIO
 		t.Fatalf("heal needing 2 blocks with 1 left = %v, want EIO", e)
 	}
 	if got := inj.Spare(); got != 1 {
@@ -189,7 +189,7 @@ func TestSpareBlocksExhausted(t *testing.T) {
 	}
 	// 坏区 4096 需 1 块 == 1 → 可治愈，spare→0。
 	inj.Add(Rule{Op: OpRead, Path: "g", Off: 0, OffLen: 4096, Errno: syscall.EIO, HealOnWrite: true})
-	if e := inj.Check(OpWrite, "g", 0); e != 0 {
+	if e := inj.Check(OpWrite, "g", 0, 4096); e != 0 { // 需 1 块 == 1 spare → 治愈
 		t.Fatalf("heal needing 1 block with 1 left = %v, want 0", e)
 	}
 	if got := inj.Spare(); got != 0 {
@@ -207,9 +207,9 @@ func TestRefreshReturnsEntries(t *testing.T) {
 	idUntouched := inj.Add(Rule{Op: OpRead, Path: "u", Errno: syscall.ENOSPC}) // 从不命中，状态不变
 
 	// 触发变动：治愈 h、消耗 n 两次。
-	inj.Check(OpWrite, "h", 0) // 治愈 h
-	inj.Check(OpRead, "n", 0)
-	inj.Check(OpRead, "n", 0)
+	inj.Check(OpWrite, "h", 0, 1) // 治愈 h
+	inj.Check(OpRead, "n", 0, 1)
+	inj.Check(OpRead, "n", 0, 1)
 
 	res := inj.Refresh(RefreshOptions{})
 	gotRule := map[int]string{} // rule id -> "Before->After"
@@ -247,7 +247,7 @@ func TestRefreshReturnsEntries(t *testing.T) {
 	// 让 spare 被消耗：有限 spare + 治愈，再 Refresh 应报 spare 条目（before≠after）。
 	inj.SetSpare(2)
 	inj.Add(Rule{Op: OpRead, Path: "x", Errno: syscall.EIO, HealOnWrite: true})
-	inj.Check(OpWrite, "x", 0) // 消耗 1，spare 2→1
+	inj.Check(OpWrite, "x", 0, 1) // 消耗 1，spare 2→1
 	res2 := inj.Refresh(RefreshOptions{})
 	var sawSpare bool
 	for _, e := range res2.Entries {
@@ -269,7 +269,7 @@ func TestRefreshSkipLatency(t *testing.T) {
 	inj.SetProfile(ProfileSSD) // current=initial=ssd（setter 同步 initial）
 	inj.SetSpare(2)
 	inj.Add(Rule{Op: OpRead, Path: "h", Errno: syscall.EIO, HealOnWrite: true})
-	inj.Check(OpWrite, "h", 0) // 治愈：消耗 1 块，spare 2→1
+	inj.Check(OpWrite, "h", 0, 1) // 治愈：消耗 1 块，spare 2→1
 
 	// SkipLatency=true：rule（治愈复位）与 spare（1→2）条目必须照常出现，
 	// 证明 SkipLatency 只跳过 latency、不抑制 rule/spare 复位。
@@ -309,13 +309,13 @@ func TestDefaultSpareZeroBlocksHeal(t *testing.T) {
 		t.Fatalf("NewInjector 默认 Spare = %d, want 0", got)
 	}
 	inj.Add(Rule{Op: OpRead, Path: "f", Errno: syscall.EIO, HealOnWrite: true})
-	if e := inj.Check(OpRead, "f", 0); e != syscall.EIO {
+	if e := inj.Check(OpRead, "f", 0, 1); e != syscall.EIO {
 		t.Fatalf("read = %v, want EIO", e)
 	}
-	if e := inj.Check(OpWrite, "f", 0); e != syscall.EIO {
+	if e := inj.Check(OpWrite, "f", 0, 1); e != syscall.EIO {
 		t.Fatalf("默认 spare=0 时 write = %v, want EIO（无备用可治愈）", e)
 	}
-	if e := inj.Check(OpRead, "f", 0); e != syscall.EIO {
+	if e := inj.Check(OpRead, "f", 0, 1); e != syscall.EIO {
 		t.Fatalf("未治愈时再读 = %v, want EIO", e)
 	}
 }
@@ -345,7 +345,7 @@ func TestBlocksNeededNoOverflow(t *testing.T) {
 	inj := NewInjector()
 	inj.SetSpareBlocks(2, 4096)
 	inj.Add(Rule{Op: OpRead, Path: "big", Off: 0, OffLen: max, Errno: syscall.EIO, HealOnWrite: true})
-	if e := inj.Check(OpWrite, "big", 0); e != syscall.EIO {
+	if e := inj.Check(OpWrite, "big", 0, 1); e != syscall.EIO {
 		t.Fatalf("极大坏区 + 仅 2 块 spare，write = %v, want EIO", e)
 	}
 	if got := inj.Spare(); got != 2 {
@@ -362,7 +362,82 @@ func TestSetSpareBlocksClampsInvalidCount(t *testing.T) {
 		t.Fatalf("SetSpareBlocks(-5,4096) 后 Spare = %d, want 0（钳到 0）", got)
 	}
 	inj.Add(Rule{Op: OpRead, Path: "f", Errno: syscall.EIO, HealOnWrite: true})
-	if e := inj.Check(OpWrite, "f", 0); e != syscall.EIO {
+	if e := inj.Check(OpWrite, "f", 0, 1); e != syscall.EIO {
 		t.Fatalf("钳到 0 后 write = %v, want EIO", e)
+	}
+}
+
+// TestHealOnWrite_PartialCoverage:按块模式下，部分覆盖 write 只治愈其实际写入的块——
+// 未覆盖块 read 仍 EIO（真硬盘 UNC 语义，避免 backing 旧数据被误读为已修复）。这是对旧实现
+// "write 命中即整段 healed" 的回归保护。同时验证 RuleView 的 HealedBlocks/TotalBlocks。
+func TestHealOnWrite_PartialCoverage(t *testing.T) {
+	inj := NewInjector()
+	inj.SetSpareBlocks(2, 4096) // 2 个 4KiB 块
+	inj.Add(Rule{Op: OpRead, Path: "f", Off: 0, OffLen: 8192, Errno: syscall.EIO, HealOnWrite: true})
+
+	// read 全区 → EIO（未治愈）。
+	if e := inj.Check(OpRead, "f", 0, 8192); e != syscall.EIO {
+		t.Fatalf("read 全区 = %v, want EIO", e)
+	}
+	// write 仅前 4096（块 0）→ 治愈块 0，扣 1 spare。
+	if e := inj.Check(OpWrite, "f", 0, 4096); e != 0 {
+		t.Fatalf("write 块0 = %v, want 0 (healed)", e)
+	}
+	if got := inj.Spare(); got != 1 {
+		t.Fatalf("spare after healing 1 block = %d, want 1", got)
+	}
+	// RuleView：1/2，Healed=false。
+	v := inj.List()[0]
+	if v.TotalBlocks != 2 || v.HealedBlocks != 1 || v.Healed {
+		t.Fatalf("RuleView = %+v, want 1/2 not fully healed", v)
+	}
+	// read 块 0（前 4096）→ 放行（已治愈）。
+	if e := inj.Check(OpRead, "f", 0, 4096); e != 0 {
+		t.Fatalf("read 块0 = %v, want 0 (healed)", e)
+	}
+	// read 块 1（off 4096，后 4096）→ EIO（未治愈）。
+	if e := inj.Check(OpRead, "f", 4096, 4096); e != syscall.EIO {
+		t.Fatalf("read 块1 = %v, want EIO (not healed)", e)
+	}
+	// read 跨块 0-1（[0,8192)）→ EIO（块 1 未治愈，保守整体 EIO）。
+	if e := inj.Check(OpRead, "f", 0, 8192); e != syscall.EIO {
+		t.Fatalf("read 跨块 = %v, want EIO（块1 未治愈）", e)
+	}
+	// 再 write 块 1（off 4096）→ 治愈块 1，扣 1 spare，spare→0。
+	if e := inj.Check(OpWrite, "f", 4096, 4096); e != 0 {
+		t.Fatalf("write 块1 = %v, want 0 (healed)", e)
+	}
+	if got := inj.Spare(); got != 0 {
+		t.Fatalf("spare after healing 2nd block = %d, want 0", got)
+	}
+	// read 全区 → 放行（全治愈）。
+	if e := inj.Check(OpRead, "f", 0, 8192); e != 0 {
+		t.Fatalf("read 全区 after all healed = %v, want 0", e)
+	}
+	// RuleView：2/2，Healed=true。
+	v2 := inj.List()[0]
+	if v2.TotalBlocks != 2 || v2.HealedBlocks != 2 || !v2.Healed {
+		t.Fatalf("RuleView = %+v, want 2/2 fully healed", v2)
+	}
+}
+
+// TestHealOnWrite_HugeRegionFallsBackToWhole:OffLen 极大（超 maxHealedBlocks）的 HealOnWrite
+// 规则回退整段模式（不分配 healedBlocks），write 整段治愈、按 blocksNeeded 整体扣 spare。
+// 防止 make([]bool, 极大) OOM，并保留"整段消耗"语义（spare 不足则 EIO）。
+func TestHealOnWrite_HugeRegionFallsBackToWhole(t *testing.T) {
+	inj := NewInjector()
+	inj.SetSpareBlocks(2, 4096)
+	// OffLen 远超 maxHealedBlocks*blockSize → 回退整段模式。
+	inj.Add(Rule{Op: OpRead, Path: "big", Off: 0, OffLen: 1 << 40, Errno: syscall.EIO, HealOnWrite: true})
+	v := inj.List()[0]
+	if v.TotalBlocks != 1 {
+		t.Fatalf("超大坏区应回退整段模式（TotalBlocks=1），得 %d", v.TotalBlocks)
+	}
+	// write 命中 → 整段治愈，需 blocksNeeded(1<<40,4096)=1<<28 块 >> spare 2 → EIO，spare 不变。
+	if e := inj.Check(OpWrite, "big", 0, 4096); e != syscall.EIO {
+		t.Fatalf("超大坏区 + 仅 2 块 spare，write = %v, want EIO", e)
+	}
+	if got := inj.Spare(); got != 2 {
+		t.Fatalf("spare 被污染 = %d, want 2（未治愈不应消耗）", got)
 	}
 }

@@ -51,7 +51,7 @@ func main() {
 
 func newMountCmd() *cobra.Command {
 	var detach bool
-	var randStr, seqStr, spareStr string
+	var randStr, seqStr, spareStr, capacityStr string
 	c := &cobra.Command{
 		Use:   "mount <backing> <mp>",
 		Short: "挂载一个 faultfs（backing 透传），前台守护；--detach 后台运行",
@@ -62,7 +62,7 @@ func newMountCmd() *cobra.Command {
 				// detach：把挂载参数透传给 fork 出的守护子进程，由其完成 setup。
 				return detachSelf(backing, mp, mountExtraArgs(cmd))
 			}
-			inj, warns, err := buildInjector(backing, randStr, seqStr, spareStr)
+			inj, warns, err := buildInjector(backing, randStr, seqStr, spareStr, capacityStr)
 			if err != nil {
 				return err
 			}
@@ -73,9 +73,10 @@ func newMountCmd() *cobra.Command {
 		},
 	}
 	c.Flags().BoolVar(&detach, "detach", false, "后台守护，立即返回")
-	c.Flags().StringVar(&randStr, "rand", "", "初始随机寻址延迟（ns/us/ms，如 8ms；空=不启用性能模拟，直透 backing）")
-	c.Flags().StringVar(&seqStr, "seq", "", "初始顺序读写速度（M=MiB/s、G=GiB/s，如 100M；空=不启用）")
+	c.Flags().StringVar(&randStr, "rand", "", "初始随机寻址延迟增量（ns/us/ms，如 8ms；叠加在 backing 上；空=不启用性能模拟）")
+	c.Flags().StringVar(&seqStr, "seq", "", "初始顺序读写速度上限（M=MiB/s、G=GiB/s，如 100M；空=不启用）")
 	c.Flags().StringVar(&spareStr, "spare", "", "初始备用块预算（如 8*4KiB = 8 个 4KiB 块；空=0，挂载后用 set spare 设）")
+	c.Flags().StringVar(&capacityStr, "capacity", "", "模拟容量上限（如 100M/1G；空=不限制。须 > backing 已用且 < 总量，用于模拟磁盘满）")
 	return c
 }
 
@@ -83,7 +84,7 @@ func newMountCmd() *cobra.Command {
 // 额外命令行参数（保持前台/后台两条路径用同一份参数完成 setup）。
 func mountExtraArgs(cmd *cobra.Command) []string {
 	var args []string
-	for _, name := range []string{"rand", "seq", "spare"} {
+	for _, name := range []string{"rand", "seq", "spare", "capacity"} {
 		if cmd.Flags().Changed(name) {
 			v, _ := cmd.Flags().GetString(name)
 			args = append(args, "--"+name, v)
@@ -92,10 +93,12 @@ func mountExtraArgs(cmd *cobra.Command) []string {
 	return args
 }
 
-// buildInjector 按挂载参数构造 *Injector 并设初始 profile/spare（同步 initial 快照，供
-// refresh 复位）。--rand/--seq 至少其一给定则启用性能模拟（按 backing 钳制并返回告警）；
-// --spare 给定则设块预算，否则保持 NewInjector 默认 0。返回 (inj, warns, err)。
-func buildInjector(backing, randStr, seqStr, spareStr string) (*faultfs.Injector, []string, error) {
+// buildInjector 按挂载参数构造 *Injector 并设初始 profile/spare/capacity（profile/spare 同步
+// initial 快照供 refresh 复位；capacity 不进 refresh，mount 固化）。--rand/--seq 至少其一给定则
+// 启用性能模拟（rand 为叠加增量、seq 为限制上限；仅 seq 触发 backing 校准+告警）；--spare 给定
+// 则设块预算；--capacity 给定则设模拟容量上限（mount 时由 checkCapacityAtMount 校验区间）。
+// 返回 (inj, warns, err)。
+func buildInjector(backing, randStr, seqStr, spareStr, capacityStr string) (*faultfs.Injector, []string, error) {
 	inj := faultfs.NewInjector()
 	var warns []string
 	if randStr != "" || seqStr != "" {
@@ -124,6 +127,13 @@ func buildInjector(backing, randStr, seqStr, spareStr string) (*faultfs.Injector
 			return nil, nil, err
 		}
 		inj.SetSpareBlocks(count, bs)
+	}
+	if capacityStr != "" {
+		capVal, err := faultfs.ParseCapacity(capacityStr)
+		if err != nil {
+			return nil, nil, err
+		}
+		inj.SetCapacity(capVal)
 	}
 	return inj, warns, nil
 }
@@ -308,8 +318,8 @@ func newListCmd() *cobra.Command {
 				fmt.Println("(no rules)")
 			}
 			for _, r := range resp.Rules {
-				fmt.Printf("id=%d op=%s path=%q off=%d off-len=%d errno=%d n=%d heal=%v healed=%v rem=%d\n",
-					r.ID, r.Op, r.Path, r.Off, r.OffLen, r.Errno, r.N, r.HealOnWrite, r.Healed, r.Remaining)
+				fmt.Printf("id=%d op=%s path=%q off=%d off-len=%d errno=%d n=%d heal=%v healed=%s rem=%d\n",
+					r.ID, r.Op, r.Path, r.Off, r.OffLen, r.Errno, r.N, r.HealOnWrite, formatHealed(r), r.Remaining)
 			}
 			return nil
 		},
@@ -504,11 +514,11 @@ func newStatusCmd() *cobra.Command {
 			if asJSON {
 				return writeJSON(resp)
 			}
-			fmt.Printf("rules=%d  spare=%s  speed=%v  profile=%s\n",
-				len(resp.Rules), faultfs.FormatSpare(resp.Spare, resp.SpareBlockSize), resp.Speed, resp.Profile)
+			fmt.Printf("rules=%d  spare=%s  capacity=%s  speed=%v  profile=%s\n",
+				len(resp.Rules), faultfs.FormatSpare(resp.Spare, resp.SpareBlockSize), formatCapacity(resp.Capacity), resp.Speed, resp.Profile)
 			for _, r := range resp.Rules {
-				fmt.Printf("  [%d] op=%s path=%q healed=%v rem=%d errno=%d(%s)\n",
-					r.ID, r.Op, r.Path, r.Healed, r.Remaining, r.Errno, errnoName(r.Errno))
+				fmt.Printf("  [%d] op=%s path=%q healed=%s rem=%d errno=%d(%s)\n",
+					r.ID, r.Op, r.Path, formatHealed(r), r.Remaining, r.Errno, errnoName(r.Errno))
 			}
 			return nil
 		},
@@ -538,12 +548,12 @@ func newDumpCmd() *cobra.Command {
 			d := resp.Dump
 			fmt.Printf("mount_pid=%d\nbacking=%s\nsocket=%s\nmount_time=%s\n",
 				d.MountPID, d.Backing, d.Socket, d.MountTime)
-			fmt.Printf("profile=%s speed=%v spare=%s rules=%d\n",
-				d.ProfileName, d.Speed, faultfs.FormatSpare(d.Spare, d.SpareBlockSize), len(d.Rules))
+			fmt.Printf("profile=%s speed=%v spare=%s capacity=%s rules=%d\n",
+				d.ProfileName, d.Speed, faultfs.FormatSpare(d.Spare, d.SpareBlockSize), formatCapacity(d.Capacity), len(d.Rules))
 			for _, r := range d.Rules {
-				fmt.Printf("  [%d] op=%s path=%q off=%d off-len=%d errno=%d(%s) n=%d heal=%v healed=%v rem=%d\n",
+				fmt.Printf("  [%d] op=%s path=%q off=%d off-len=%d errno=%d(%s) n=%d heal=%v healed=%s rem=%d\n",
 					r.ID, r.Op, r.Path, r.Off, r.OffLen, r.Errno, errnoName(r.Errno),
-					r.N, r.HealOnWrite, r.Healed, r.Remaining)
+					r.N, r.HealOnWrite, formatHealed(r), r.Remaining)
 			}
 			fmt.Println("profile_fields:")
 			for _, k := range sortedKeys(d.ProfileFields) {
@@ -579,4 +589,24 @@ func sortedKeys(m map[string]string) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// formatCapacity 把模拟容量格式化为展示串：<=0（未启用）→ "unlimited"，否则用 FormatSize。
+func formatCapacity(cap int64) string {
+	if cap <= 0 {
+		return "unlimited"
+	}
+	return faultfs.FormatSize(cap)
+}
+
+// formatHealed 把规则的治愈状态格式化为展示串：非 HealOnWrite → "n/a"；按块模式 → "N/M"
+// （已治愈块数/总块数）；整段模式 → "true"/"false"。
+func formatHealed(r control.RuleView) string {
+	if !r.HealOnWrite {
+		return "n/a"
+	}
+	if r.TotalBlocks > 0 {
+		return fmt.Sprintf("%d/%d", r.HealedBlocks, r.TotalBlocks)
+	}
+	return strconv.FormatBool(r.Healed)
 }

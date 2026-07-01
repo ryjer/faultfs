@@ -26,19 +26,34 @@
 命中且 `remaining>0` → 返回 `Errno`，`remaining--`；`remaining==0` 后失效。`N=0`
 表示永久（`remaining=-1`）。“前 N 次后自愈”由 `N` 表达。
 
-## HealOnWrite 坏扇区模型（有状态）
+## HealOnWrite 坏扇区模型（有状态，按块治愈）
 
 真实硬盘语义：read 坏扇区→EIO；write 该区→备用扇区重映射→write 成功、后续 read
-正常；备用耗尽→write 也 EIO。规则**持久保留**（不删除），带运行时状态 `healed`：
+正常；备用耗尽→write 也 EIO。规则**持久保留**（不删除），带运行时状态。
 
-- read 命中 `HealOnWrite` 规则：`healed`→放行（读到重映射后数据）；`!healed`→返 `Errno`（EIO）。
-- write 命中（同 Path+Off 区间）且 `!healed`：`need=ceil(坏区长度/spareBlockSize)`
-  （最小 1）；`spareCount==-1` 或 `spareCount>=need`→置 `healed=true`、`spareCount>0` 时
-  `spareCount-=need`（整块消耗）、放行 write；否则返 `Errno`（备用块不足，write 也失败）。
-- write 命中已 `healed` 的规则→放行。
+**整段 vs 按块**（由 `Add` 时的 `spareBlockSize` 决定并固化，避免后续改 blockSize 致标记错位）：
 
+- **按块模式**（`spareBlockSize>1` 且 `OffLen>0`）：按 `ceil(OffLen/spareBlockSize)` 切块，每块独立
+  跟踪治愈状态。**部分覆盖 write 只治愈其实际写入的块**——按请求 `[off,off+len)` 与坏区的交集映射
+  到块，未覆盖块 read 仍 EIO。符合真硬盘 UNC 语义：上层 `inlineRepair` 若只部分重写，未重写部分
+  读到的应是错误/UNC，而不是 backing 旧的正确数据（旧实现整段一次性 `healed` 会给出虚假乐观结果）。
+- **整段模式**（`spareBlockSize<=1` 或 `OffLen<=0`；或按块模式下块数超 `maxHealedBlocks` 阈值
+  回退以防 `make([]bool,N)` OOM）：单个 `healed` 标志，write 命中即整段治愈（兼容纯次数语义）。
+
+`Check(op, path, off, length)` 多带 `length`（read/write 请求字节数；其他 op 传 0），仅按块治愈判定用：
+
+- read 命中：整段模式 `healed`→放行 / `!healed`→EIO；按块模式：请求覆盖的块**全治愈**才放行，
+  任一未治愈→EIO（保守：跨好坏块整体 EIO）。
+- write 命中且未全治愈：`need` = 本次 write **新覆盖的未治愈块数**；`spareCount==-1` 或
+  `>=need`→置这些块 healed、`spareCount-=need`、放行；否则返 `Errno`（备用不足，**不治愈任何块**，原子）。
+- write 命中已全治愈→放行。
+
+`RuleView.HealedBlocks/TotalBlocks` 暴露治愈进度（如 `1/2`）；`Healed` 仅在全治愈时为 true。
 `HealOnWrite` 规则的 op 匹配放宽到 `{read, write}`（注入点是 read，write 触发治愈）。
 正是 FSS raif `inlineRepair`（读 EIO → 重构 → 写回触发重映射）所依赖的语义。
+
+> 坏扇区模型假设 backing 数据可信（注入的 EIO 是"假坏"）。若 backing 真坏（非 tmpfs），`healed`
+> 状态会与真实 EIO 不一致，致自愈死循环——见 [capacity.md](capacity.md) 的 backing 选择建议。
 
 ## spare 备用块预算
 
@@ -83,9 +98,10 @@ type RefreshResult struct{ Entries []ResetEntry }
 | `Add(r Rule) int` | 追加规则，返回分配的 ID |
 | `Delete(id int) bool` | 按 ID 删除 |
 | `Clear()` / `Reset()` | 清空所有规则 |
-| `List() []RuleView` | 规则视图快照（含 `healed`/`remaining`） |
+| `List() []RuleView` | 规则视图快照（含 `healed`/`healedBlocks`/`remaining`） |
 | `Refresh(opts RefreshOptions) RefreshResult` | 重置规则/spare/（默认）性能参数到初始态，返回变动条目 |
 | `SetSpare(n)` / `SetSpareBlocks(count, blockSize)` / `Spare()` / `SpareBlockSize()` | 备用块预算 |
+| `SetCapacity(capacity)` / `Capacity()` | 模拟容量上限（mount 固化、不进 Refresh；见 [capacity.md](capacity.md)） |
 | `SetProfile` / `SetSpeed` / `Profile` / `Speed` | 延迟模型（见 latency.md） |
 
 Go 库直接调这些方法；CLI 通过 control socket 触发同样的方法（见 control.md）。

@@ -161,19 +161,25 @@ func (in *Injector) CalibratedFloor() (randLatency time.Duration, seqBw float64,
 // （可能为空）。库用户与 set-latency 控制路径共用本方法，确保"按 backing 钳制"的策略
 // 只此一处实现（避免 CLI 与文档示例两套钳制逻辑各自漂移）。校准失败不阻断：透传目标，
 // 仅返回告警。
+//
+// rand（随机寻址延迟）是叠加增量，不需 backing 校准；仅当目标含顺序带宽（ReadByte/WriteByte
+// >0，即"限制"语义需 backing 上限来判定是否告警）时才触发校准。rand-only 配置跳过几十 ms
+// 校准直接写入。
 func (in *Injector) SetProfileCalibrated(backing string, target LatencyProfile) []string {
-	measRand, measBw, calibErr := in.calibrateCached(backing)
+	if target.ReadByte <= 0 && target.WriteByte <= 0 {
+		in.SetProfile(target) // rand-only 或全 0：无带宽需钳制，跳过校准
+		return nil
+	}
+	_, measBw, calibErr := in.calibrateCached(backing)
 	switch {
 	case calibErr != nil:
 		in.SetProfile(target)
-		return []string{"backing 性能校准失败(" + calibErr.Error() + ")，已跳过 tmpfs 钳制"}
-	case measRand > 0 || measBw > 0:
-		adj, warns := AdjustProfile(target, measRand, measBw)
+		return []string{"backing 性能校准失败(" + calibErr.Error() + ")，已跳过顺序带宽钳制"}
+	default:
+		adj, warns := AdjustProfile(target, 0, measBw) // rand 不钳（增量），仅钳 seq 带宽
 		in.SetProfile(adj)
 		return warns
 	}
-	in.SetProfile(target)
-	return nil
 }
 
 // sleepFor 阻塞 d×sp（d<=0 不阻塞）。调用时已离开 mu 锁。
@@ -382,6 +388,32 @@ func ParseSpeed(s string) (float64, error) {
 		return 0, &knobParseError{kind: "speed", raw: s, hint: "速度过小（最小 1 B/s；0=不限速）"}
 	}
 	return bw, nil
+}
+
+// ParseCapacity 解析容量字符串为字节数。接受 "100M"/"100MiB"（=100MiB）、"1G"/"1GiB"、
+// "512K"/"512KiB"，以及裸数字（=字节）。大小写不敏感。拒绝负值、NaN/Inf 与超出 int64
+// 可表示范围的值。用于 mount --capacity 与 [Injector.SetCapacity]；展示用 [FormatSize]。
+func ParseCapacity(s string) (int64, error) {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return 0, &knobParseError{kind: "capacity", raw: s, hint: "不能为空；示例：100M / 1G / 100MiB"}
+	}
+	bw, err := parseBytesFloat(t)
+	if err != nil {
+		return 0, &knobParseError{kind: "capacity", raw: s, hint: "示例：100M / 1G / 100MiB（M=MiB，G=GiB）"}
+	}
+	if math.IsNaN(bw) || math.IsInf(bw, 0) {
+		return 0, &knobParseError{kind: "capacity", raw: s, hint: "容量不能为 NaN/Inf"}
+	}
+	if bw < 0 {
+		return 0, &knobParseError{kind: "capacity", raw: s, hint: "容量不可为负"}
+	}
+	r := math.Round(bw)
+	// 防 int64 溢出：超大值会让 int64(r) 静默回绕（与 ParseSpareSpec 同防范）。
+	if r >= float64(math.MaxInt64) {
+		return 0, &knobParseError{kind: "capacity", raw: s, hint: "容量超出可表示范围"}
+	}
+	return int64(r), nil
 }
 
 // parseBytesFloat 解析带可选单位（K/KiB/M/MiB/G/GiB，大小写不敏感）的字节数为 float64；
@@ -667,31 +699,17 @@ func Calibrate(backing string) (randLatency time.Duration, seqBw float64, err er
 	return randLatency, seqBw, nil
 }
 
-// AdjustProfile 把目标 profile 钳制到 backing 实测上限（measuredRand / measuredBw）之内：
-// faultfs 只能叠加延迟，故 effectiveRand = max(0, targetRand - measuredRand)、
-// effectiveByte = max(0, targetByte - measuredByte)。当目标比 backing 更快（被钳到 0）
-// 时产出告警。measuredRand<=0 或 measuredBw<=0 视为该维度未校准，对应字段透传不钳制。
-// 各元数据 op（open/getattr/…）也由 applyRandLatency 按一次随机寻址写入，故一并按
-// measuredRand 钳制（静默，告警已由随机读/写覆盖，避免重复刷屏）。
+// AdjustProfile 把目标 profile 的顺序带宽钳制到 backing 实测上限（measuredBw）之内。
+// rand（随机寻址延迟 + 由 applyRandLatency 派生的各元数据 op）语义为"在 backing 上叠加的
+// 增量"——永远让设备更慢，故不钳制、原样透传；measuredRand 参数保留仅为签名兼容，不再起作用。
+// 顺序带宽语义为"限制上限"：faultfs 通过 per-byte sleep 把 host 速度降到目标，当目标带宽 >
+// backing（想限到的速度比 backing 还快）时实际取 backing 并告警。measuredBw<=0 视为未校准，
+// 带宽字段透传不钳。
 func AdjustProfile(p LatencyProfile, measuredRand time.Duration, measuredBw float64) (LatencyProfile, []string) {
+	_ = measuredRand // rand 现为叠加增量，不钳制；保留参数以维持调用方签名兼容
 	out := p
 	var warns []string
-	// 随机寻址延迟钳制（per-request）。
-	if measuredRand > 0 {
-		out.ReadRand, _ = subClampDur(p.ReadRand, measuredRand, &warns, "随机读")
-		out.WriteRand, _ = subClampDur(p.WriteRand, measuredRand, &warns, "随机写")
-		// 元数据 op 同样按一次随机寻址计（见 applyRandLatency），一并钳制；
-		// 传 nil warns 静默钳制（随机读/写的告警已足以提示"目标快于 backing"）。
-		for _, f := range []*time.Duration{
-			&out.Open, &out.Getattr, &out.Statfs, &out.Setattr,
-			&out.Getxattr, &out.Setxattr, &out.Removexattr, &out.Listxattr,
-			&out.Create, &out.Mkdir, &out.Unlink, &out.Rename,
-			&out.Fsync, &out.Flush,
-		} {
-			*f, _ = subClampDur(*f, measuredRand, nil, "")
-		}
-	}
-	// 顺序带宽钳制（per-byte → 带宽）。
+	// 顺序带宽钳制（per-byte → 带宽）：限制语义，目标快于 backing 时取 backing 并告警。
 	if measuredBw > 0 {
 		measuredByte := bwToByteDur(measuredBw)
 		eb, _ := subClampDur(p.ReadByte, measuredByte, &warns, "顺序读")

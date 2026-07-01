@@ -92,11 +92,11 @@ faultfs 是一个 FUSE loopback 文件系统：把一个 backing 目录透传到
    └────────────────────────────────────────────┘
 ```
 
-`set-latency` 的特殊处理：首次调用（经 `Injector.SetProfileCalibrated`）触发 `Calibrate(backing)`
-实测 backing 的随机寻址延迟 + 顺序带宽并缓存（`sync.Once` 保证并发首调只跑一次），`AdjustProfile`
-把目标参数里"比 backing 还快"的部分钳到 0 并在 `Resp.Warns` 逐条告警（"用更强的 tmpfs 模拟更弱
-的系统；预设值超出 tmpfs 时改用 tmpfs 模拟"）。`--profile` 与 `--rand`/`--seq` 互斥，`--speed` 可与
-任一组合。
+`set-latency` 的特殊处理：`rand`（随机寻址延迟）是叠加增量、不钳制、不告警；`seq`（顺序速度）是
+上限，首次给 `--seq` 时（经 `Injector.SetProfileCalibrated`）触发 `Calibrate(backing)` 实测 backing
+顺序带宽并缓存（`sync.Once` 保证并发首调只跑一次），`AdjustProfile` 把 seq 目标里超出 backing 的
+部分钳到 0 并在 `Resp.Warns` 告警。rand-only 配置跳过校准。`--profile` 与 `--rand`/`--seq` 互斥，
+`--speed` 可与任一组合。
 
 ## 包布局与依赖方向
 
@@ -126,9 +126,14 @@ control     ──►  （仅标准库；刻意不 import faultfs，避免循环
   透传。配 `var _ fs.NodeXxx = (*FaultNode)(nil)` 静态断言，防签名写错时静默回落到嵌入实现。
 - **配置/状态分离 + Refresh**：`Rule`（配置）与 `ruleState`（运行时 `remaining`/`healed`）
   分开，`Refresh` 只重置运行时状态与 `spare`，配置不变——用于"治愈→刷新→再次故障"反复重放。
-- **坏扇区有状态模型**：`HealOnWrite` 把 read 规则变成"read EIO / write 治愈"的真实硬盘语义，
-  write 命中触发备用扇区重映射、消耗一格 `spare`；spare 耗尽则 write 也 EIO。正是 FSS raif
-  `inlineRepair`（读 EIO→重构→写回触发重映射）所依赖的语义。
+- **坏扇区有状态模型（按块治愈）**：`HealOnWrite` 把 read 规则变成"read EIO / write 治愈"的真实硬盘
+  语义。`spareBlockSize>1` 且 `OffLen>0` 时按块跟踪治愈——部分覆盖 write 只治愈其实际写入的块，
+  未覆盖块 read 仍 EIO（避免 backing 旧数据被误读为已修复）。正是 FSS raif `inlineRepair`
+  （读 EIO→重构→写回触发重映射）所依赖的语义。
+- **模拟容量（capacity）**：挂载时设 `capacity` 上限，运行时 write 超 capacity 返 `ENOSPC`、
+  `statfs` 反映模拟容量；挂载校验保证"模拟的满先于 backing 真满"。详见 [capacity.md](capacity.md)。
+- **backing 须为 tmpfs**：故障/坏扇区/容量模拟都假设 backing 是可信数据源（注入的 EIO 是"假坏"）；
+  非 tmpfs 的真实坏道会让 `healed` 状态与真实 EIO 不一致、致上层自愈死循环。见 [capacity.md](capacity.md)。
 - **不短路无变更操作**：faultfs 与内核都不短路"无实际变更"的 op；唯一会"丢"请求的是用户态
   工具（coreutils `chmod`/`chown` 同值时跳过系统调用）。详见 [injector.md](injector.md) 与
   包文档。
