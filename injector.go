@@ -213,14 +213,14 @@ func (in *Injector) Refresh(opts RefreshOptions) RefreshResult {
 			entries = append(entries, ResetEntry{What: "rule", ID: s.r.ID, Before: before, After: after})
 		}
 	}
-	// spare 复位到初始块预算（count + blockSize）。
+	// spare 复位到初始块预算（count + blockSize）。外层按字段比较决定是否复位与记条目：
+	// 字段变化即记（哪怕 FormatSpare 文本碰巧相同，如 count=-1 时 blockSize 的变化——复位
+	// 确实发生了，应如实记录，不靠文本比较吞掉条目）。
 	sBefore := FormatSpare(in.spareCount, in.spareBlockSize)
 	if in.spareCount != in.initialSpareCount || in.spareBlockSize != in.initialSpareBlockSize {
 		in.spareCount = in.initialSpareCount
 		in.spareBlockSize = in.initialSpareBlockSize
-		if after := FormatSpare(in.spareCount, in.spareBlockSize); after != sBefore {
-			entries = append(entries, ResetEntry{What: "spare", Before: sBefore, After: after})
-		}
+		entries = append(entries, ResetEntry{What: "spare", Before: sBefore, After: FormatSpare(in.spareCount, in.spareBlockSize)})
 	}
 	// 性能参数复位（默认；--keep-latency 跳过）。latency 无消耗路径，current 通常已等于
 	// initial，故这里多为 no-op；保留复位以兑现"重置回初始值"语义并提供显式安全开关。
@@ -249,12 +249,17 @@ func latencyStateText(p LatencyProfile, speed float64) string {
 // 同步更新初始快照，故 Refresh 会还原到该值。需要按真实块大小计费时用 [Injector.SetSpareBlocks]。
 func (in *Injector) SetSpare(n int64) { in.SetSpareBlocks(n, 1) }
 
-// SetSpareBlocks 设备用块预算：count 个 blockSize 字节的块（count=-1 无限；blockSize<1 钳到 1）。
-// 同步更新初始快照，故 Refresh 会还原到该值。治愈一段坏区时按 ceil(坏区长度/blockSize) 整块
-// 消耗（见 [blocksNeeded]）。
+// SetSpareBlocks 设备用块预算：count 个 blockSize 字节的块（count=-1 无限、>=0 有效；
+// count<-1 无定义，钳到 0；blockSize<1 钳到 1）。同步更新初始快照，故 Refresh 会还原到
+// 该值。治愈一段坏区时按 ceil(坏区长度/blockSize) 整块消耗（见 [blocksNeeded]）。
 func (in *Injector) SetSpareBlocks(count, blockSize int64) {
 	if blockSize < 1 {
 		blockSize = 1
+	}
+	// count 合法值：-1（无限）或 >=0；< -1 无定义（与 ParseSpareSpec 的拒绝一致），
+	// 钳到 0（无备用，fail-safe）——与 SetSpeed<=0、blockSize<1 的静默钳制风格一致。
+	if count < -1 {
+		count = 0
 	}
 	in.mu.Lock()
 	defer in.mu.Unlock()
@@ -285,7 +290,14 @@ func blocksNeeded(offLen, blockSize int64) int64 {
 	if blockSize <= 1 || offLen <= 0 {
 		return 1
 	}
-	return (offLen + blockSize - 1) / blockSize
+	// 用 div+mod 算 ceil，避免 (offLen+blockSize-1) 在 offLen 极大（接近 MaxInt64）时
+	// 溢出回绕成负——负 need 会让 Check 误判放行治愈、并让 spareCount -= need 反向增加。
+	// 除法/取模结果 <= 被除数，q <= offLen/blockSize，q++ 后仍远小于 MaxInt64，无溢出。
+	q := offLen / blockSize
+	if offLen%blockSize != 0 {
+		q++
+	}
+	return q
 }
 
 // Check 返回命中的 errno（0 表示放行，不注入）。op 是操作类型（取 Op* 常量），

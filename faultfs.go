@@ -366,11 +366,7 @@ func handleControl(inj *Injector, meta mountMeta, req control.Req) control.Resp 
 		if !req.HasSpare {
 			return control.Resp{OK: false, Err: "no spare value specified"}
 		}
-		bs := req.SpareBlockSize
-		if bs < 1 {
-			bs = 1
-		}
-		inj.SetSpareBlocks(req.Spare, bs)
+		inj.SetSpareBlocks(req.Spare, req.SpareBlockSize) // blockSize<1 与 count<-1 由 SetSpareBlocks 统一钳制（单一真实来源）
 		return control.Resp{OK: true}
 	case control.CmdStatus:
 		return control.Resp{OK: true, Rules: toControlViews(inj.List()), Profile: profileName(inj.Profile()), Spare: inj.Spare(), SpareBlockSize: inj.SpareBlockSize(), Speed: inj.Speed()}
@@ -415,16 +411,20 @@ func setLatency(inj *Injector, backing string, req control.Req) ([]string, error
 			}
 			target = p
 		default:
-			target = ProfileNone // 从零开始用手动旋钮构建
-		}
-		if req.HasRand {
-			if req.RandNs < 0 {
-				return nil, errf("--rand 不能为负（得到 %d ns）", req.RandNs)
+			// 从零开始用手动旋钮构建：走 ProfileFromKnobs（与 mount --rand/--seq 的
+			// buildInjector 同一构造入口，避免两套实现漂移）。未给出的旋钮传 0 = 该维度不启用。
+			var randDur time.Duration
+			if req.HasRand {
+				if req.RandNs < 0 {
+					return nil, errf("--rand 不能为负（得到 %d ns）", req.RandNs)
+				}
+				randDur = time.Duration(req.RandNs)
 			}
-			applyRandLatency(&target, time.Duration(req.RandNs))
-		}
-		if req.HasSeq {
-			applySeqSpeed(&target, req.SeqBw)
+			var seqBw float64
+			if req.HasSeq {
+				seqBw = req.SeqBw
+			}
+			target = ProfileFromKnobs(randDur, seqBw)
 		}
 		warns = append(warns, inj.SetProfileCalibrated(backing, target)...)
 	}

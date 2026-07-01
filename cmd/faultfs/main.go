@@ -379,7 +379,7 @@ func newSetLatencyCmd() *cobra.Command {
 }
 
 func newSetSpareCmd() *cobra.Command {
-	return &cobra.Command{
+	c := &cobra.Command{
 		Use:   "spare <mp> <spec>",
 		Short: "设备用块预算（<count>*<size> 如 8*4KiB，或纯数量如 8；-1 无限）；refresh 会还原到该初始值",
 		Args:  cobra.ExactArgs(2),
@@ -392,6 +392,11 @@ func newSetSpareCmd() *cobra.Command {
 			return err
 		},
 	}
+	// 关闭 interspersed：spec 是位置参数且合法值含负数（-1 无限、-1*4KiB），否则 pflag 会把
+	// 起首的 "-1" 当 shorthand flag 拦截（unknown shorthand flag: '1'）。本命令无其他 flag，
+	// 故 interspersed=false 让首个位置参数之后的内容全部按位置参数处理，零副作用。
+	c.Flags().SetInterspersed(false)
+	return c
 }
 
 func newBadsectorCmd() *cobra.Command {

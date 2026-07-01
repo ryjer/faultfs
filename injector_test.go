@@ -260,19 +260,109 @@ func TestRefreshReturnsEntries(t *testing.T) {
 	}
 }
 
-// TestRefreshSkipLatency:SkipLatency=true 时不产生 latency 条目；默认（false）在 latency
-// 未变动时也无条目（no-op）。验证两条分支结构正确、不 panic。
+// TestRefreshSkipLatency:SkipLatency=true 只跳过 latency 复位，不应抑制 rule/spare 复位条目。
+// 注：所有 latency setter 同步 initial 快照、且 latency 无消耗路径，故 latency 复位恒为 no-op
+// （current==initial），latency 条目在两种 opts 下都不产生——这是设计不变量，非可观测差异；
+// 因此本测试用 rule/spare 的正向条目来证明 SkipLatency 分支确被执行且不影响其余复位。
 func TestRefreshSkipLatency(t *testing.T) {
 	inj := NewInjector()
 	inj.SetProfile(ProfileSSD) // current=initial=ssd（setter 同步 initial）
-	for _, e := range inj.Refresh(RefreshOptions{SkipLatency: true}).Entries {
-		if e.What == "latency" {
+	inj.SetSpare(2)
+	inj.Add(Rule{Op: OpRead, Path: "h", Errno: syscall.EIO, HealOnWrite: true})
+	inj.Check(OpWrite, "h", 0) // 治愈：消耗 1 块，spare 2→1
+
+	// SkipLatency=true：rule（治愈复位）与 spare（1→2）条目必须照常出现，
+	// 证明 SkipLatency 只跳过 latency、不抑制 rule/spare 复位。
+	res := inj.Refresh(RefreshOptions{SkipLatency: true})
+	var sawRule, sawSpare bool
+	for _, e := range res.Entries {
+		switch e.What {
+		case "rule":
+			sawRule = true
+		case "spare":
+			sawSpare = true
+		case "latency":
 			t.Errorf("SkipLatency=true 时不应产生 latency 条目：%+v", e)
 		}
 	}
+	if !sawRule {
+		t.Errorf("SkipLatency=true 不应抑制 rule 复位条目，得 %+v", res.Entries)
+	}
+	if !sawSpare {
+		t.Errorf("SkipLatency=true 不应抑制 spare 复位条目，得 %+v", res.Entries)
+	}
+
+	// 默认（false）：latency 复位为 no-op，不产生 latency 条目（设计不变量）。
 	for _, e := range inj.Refresh(RefreshOptions{}).Entries {
 		if e.What == "latency" {
 			t.Errorf("latency 未变动不应产生条目：%+v", e)
 		}
+	}
+}
+
+// TestDefaultSpareZeroBlocksHeal:NewInjector 默认 spare=0（破坏性变更 -1→0），故 HealOnWrite
+// 规则的 write 直接返 EIO（无备用可消耗）。锁定该默认语义，防止默认值回退成 -1（无限）而治愈
+// 静默通过、无回归保护。与显式 SetSpare(0) 等价，但更直接地约束"未显式分配即不可治愈"。
+func TestDefaultSpareZeroBlocksHeal(t *testing.T) {
+	inj := NewInjector() // 不调 SetSpare：默认 spare=0
+	if got := inj.Spare(); got != 0 {
+		t.Fatalf("NewInjector 默认 Spare = %d, want 0", got)
+	}
+	inj.Add(Rule{Op: OpRead, Path: "f", Errno: syscall.EIO, HealOnWrite: true})
+	if e := inj.Check(OpRead, "f", 0); e != syscall.EIO {
+		t.Fatalf("read = %v, want EIO", e)
+	}
+	if e := inj.Check(OpWrite, "f", 0); e != syscall.EIO {
+		t.Fatalf("默认 spare=0 时 write = %v, want EIO（无备用可治愈）", e)
+	}
+	if e := inj.Check(OpRead, "f", 0); e != syscall.EIO {
+		t.Fatalf("未治愈时再读 = %v, want EIO", e)
+	}
+}
+
+// TestBlocksNeededNoOverflow:blocksNeeded 在 offLen 接近 MaxInt64 时不得溢出回绕成负
+// （旧实现 (offLen+blockSize-1)/blockSize 会溢出，导致 Check 误判放行治愈并让 spareCount
+// 反向暴增）。回归保护本次的 div+mod 重写。
+func TestBlocksNeededNoOverflow(t *testing.T) {
+	max := int64(1<<63 - 1)
+	cases := []struct {
+		offLen, blockSize, want int64
+	}{
+		{8192, 4096, 2},           // 常规 ceil
+		{100, 4096, 1},            // 向上取整到 1
+		{4096, 4096, 1},           // 恰好整除
+		{max, 4096, max/4096 + 1}, // 极大 offLen：精确 ceil（max%4096=4095≠0），不溢出
+		{max, 2, max/2 + 1},       // blockSize=2：max 为奇数 → +1
+	}
+	for _, c := range cases {
+		got := blocksNeeded(c.offLen, c.blockSize)
+		if got != c.want || got < 0 {
+			t.Errorf("blocksNeeded(offLen=%d, bs=%d) = %d, want %d（非负）", c.offLen, c.blockSize, got, c.want)
+		}
+	}
+
+	// 端到端：极大坏区 + 仅 2 块 spare → write 应 EIO；spareCount 不被污染。
+	inj := NewInjector()
+	inj.SetSpareBlocks(2, 4096)
+	inj.Add(Rule{Op: OpRead, Path: "big", Off: 0, OffLen: max, Errno: syscall.EIO, HealOnWrite: true})
+	if e := inj.Check(OpWrite, "big", 0); e != syscall.EIO {
+		t.Fatalf("极大坏区 + 仅 2 块 spare，write = %v, want EIO", e)
+	}
+	if got := inj.Spare(); got != 2 {
+		t.Fatalf("spareCount 被污染 = %d, want 2（未治愈不应消耗）", got)
+	}
+}
+
+// TestSetSpareBlocksClampsInvalidCount:count<-1 无定义，SetSpareBlocks 钳到 0（fail-safe），
+// 与 ParseSpareSpec 拒绝 n<-1 的语义一致。钳后表现为"无备用"（治愈 EIO），不残留负值。
+func TestSetSpareBlocksClampsInvalidCount(t *testing.T) {
+	inj := NewInjector()
+	inj.SetSpareBlocks(-5, 4096) // count<-1 → 钳到 0
+	if got := inj.Spare(); got != 0 {
+		t.Fatalf("SetSpareBlocks(-5,4096) 后 Spare = %d, want 0（钳到 0）", got)
+	}
+	inj.Add(Rule{Op: OpRead, Path: "f", Errno: syscall.EIO, HealOnWrite: true})
+	if e := inj.Check(OpWrite, "f", 0); e != syscall.EIO {
+		t.Fatalf("钳到 0 后 write = %v, want EIO", e)
 	}
 }

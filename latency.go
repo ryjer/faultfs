@@ -458,22 +458,36 @@ func ParseSpareSpec(s string) (count, blockSize int64, err error) {
 	if math.Abs(bw-r) > 1e-9 {
 		return 0, 0, &knobParseError{kind: "spare", raw: s, hint: "块大小须是整数字节"}
 	}
+	// 防 int64 溢出：超大 bw（如 1e20）会让 int64(r) 静默回绕（int64(1e20)==MinInt64），
+	// 随后被 SetSpareBlocks 钳成 blockSize=1，吞掉用户意图。float64(MaxInt64) 无法精确
+	// 表示，用 >= 留出余量，超大值一律拒绝。
+	if r >= float64(math.MaxInt64) {
+		return 0, 0, &knobParseError{kind: "spare", raw: s, hint: "块大小超出可表示范围"}
+	}
 	return n, int64(r), nil
+}
+
+// formatScaled 把字节数 v 按最短表示选 GiB/MiB/KiB/B 单位阶梯，返回 (数值串, 单位串)。
+// [FormatSize]（块大小，int64）与 [FormatSpeed]（速率，float64）共用此单位选择逻辑，
+// 避免两份 GiB/MiB/KiB 阈值与后缀列表 copy-paste 漂移。
+func formatScaled(v float64) (num, unit string) {
+	switch {
+	case v >= GiB:
+		return trimFloat(v / GiB), "GiB"
+	case v >= MiB:
+		return trimFloat(v / MiB), "MiB"
+	case v >= 1<<10:
+		return trimFloat(v / (1 << 10)), "KiB"
+	default:
+		return trimFloat(v), "B"
+	}
 }
 
 // FormatSize 把字节数格式化为人类可读的大小串（最短表示）：>=GiB→GiB、>=MiB→MiB、
 // >=KiB→KiB、否则字节。用于 spare 块大小的展示。
 func FormatSize(b int64) string {
-	switch {
-	case b >= int64(GiB):
-		return trimFloat(float64(b)/GiB) + "GiB"
-	case b >= int64(MiB):
-		return trimFloat(float64(b)/MiB) + "MiB"
-	case b >= 1<<10:
-		return trimFloat(float64(b)/(1<<10)) + "KiB"
-	default:
-		return trimFloat(float64(b)) + "B"
-	}
+	num, unit := formatScaled(float64(b))
+	return num + unit
 }
 
 // FormatSpare 把备用块预算（count 个 blockSize 字节的块）格式化为展示串：
@@ -495,16 +509,8 @@ func FormatSpeed(bw float64) string {
 	if bw <= 0 {
 		return "unlimited"
 	}
-	switch {
-	case bw >= GiB:
-		return trimFloat(bw/GiB) + "GiB/s"
-	case bw >= MiB:
-		return trimFloat(bw/MiB) + "MiB/s"
-	case bw >= 1<<10:
-		return trimFloat(bw/(1<<10)) + "KiB/s"
-	default:
-		return trimFloat(bw) + "B/s"
-	}
+	num, unit := formatScaled(bw)
+	return num + unit + "/s"
 }
 
 // bwToByteDur 把顺序带宽（字节/秒）换算成 per-byte 延迟；bw<=0 → 0（不限速）。

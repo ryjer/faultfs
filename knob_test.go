@@ -334,7 +334,7 @@ func TestParseSpareSpec(t *testing.T) {
 			t.Errorf("ParseSpareSpec(%q) = (%d,%d), want (%d,%d)", c.in, count, bs, c.count, c.blockSize)
 		}
 	}
-	for _, bad := range []string{"", "abc", "8*", "*4KiB", "8*0", "8*-1", "8*abc", "--1", "8*0.5", "8*1.5"} {
+	for _, bad := range []string{"", "abc", "8*", "*4KiB", "8*0", "8*-1", "8*abc", "--1", "8*0.5", "8*1.5", "-2", "-2*4KiB", "8*99999999999999999999"} {
 		if _, _, err := ParseSpareSpec(bad); err == nil {
 			t.Errorf("ParseSpareSpec(%q) 期望失败，却成功", bad)
 		}
