@@ -1,4 +1,4 @@
-module github.com/ryjer/fss/faultfs
+module github.com/ryjer/faultfs
 
 go 1.25.0
 

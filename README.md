@@ -81,5 +81,5 @@ faultfs unmount <mp>
 ## 依赖与平台
 
 仅依赖 `go-fuse` + `cobra`（CLI）+ 标准库。需 `fuse3` + `/dev/fuse`（缺失则挂载相关
-测试自动 skip）。faultfs 是独立 go module（`github.com/ryjer/fss/faultfs`），可脱离
+测试自动 skip）。faultfs 是独立 go module（`github.com/ryjer/faultfs`），可脱离
 FSS 单独复用。

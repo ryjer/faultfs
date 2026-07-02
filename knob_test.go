@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ryjer/fss/faultfs/control"
+	"github.com/ryjer/faultfs/control"
 )
 
 func TestParseLatency(t *testing.T) {

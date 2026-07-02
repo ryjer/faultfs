@@ -24,8 +24,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/ryjer/fss/faultfs"
-	"github.com/ryjer/fss/faultfs/control"
+	"github.com/ryjer/faultfs"
+	"github.com/ryjer/faultfs/control"
 	"github.com/spf13/cobra"
 )
 

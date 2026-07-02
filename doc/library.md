@@ -5,7 +5,7 @@
 看到的**真实文件系统错误**（`os.PathError{Err: syscall.EIO}`），与底层真盘报错不可区分——
 这强于在被测系统内部伪造错误的单元测试钩子。
 
-> faultfs 是独立 go module（`github.com/ryjer/fss/faultfs`），仅依赖 go-fuse + 标准库，
+> faultfs 是独立 go module（`github.com/ryjer/faultfs`），仅依赖 go-fuse + 标准库，
 > 可脱离 FSS 单独复用。CLI 用户请看 [cli.md](cli.md)。
 
 ## 0. 快速上手
@@ -15,7 +15,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/ryjer/fss/faultfs"
+	"github.com/ryjer/faultfs"
 )
 
 func TestSomething(t *testing.T) {

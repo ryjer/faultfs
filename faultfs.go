@@ -13,7 +13,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
-	"github.com/ryjer/fss/faultfs/control"
+	"github.com/ryjer/faultfs/control"
 )
 
 // FaultNode 按指针嵌入 *fs.LoopbackNode（与 FSS 的 fssNode 同一范式），继承

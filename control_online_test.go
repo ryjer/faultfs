@@ -7,7 +7,7 @@ import (
 	"syscall"
 	"testing"
 
-	"github.com/ryjer/fss/faultfs/control"
+	"github.com/ryjer/faultfs/control"
 )
 
 // TestControlOnline_AddAndInject:端到端——经 control socket 在线 Add 一条 read
