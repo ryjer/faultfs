@@ -32,7 +32,7 @@ import (
 func main() {
 	root := &cobra.Command{
 		Use:   "faultfs",
-		Short: "可编程故障注入 FUSE 文件系统（测试用）",
+		Short: biHelp("Programmable fault-injection FUSE filesystem (for testing)", "可编程故障注入 FUSE 文件系统（测试用）"),
 	}
 	root.AddCommand(
 		newMountCmd(), newUnmountCmd(), newAddCmd(), newRmCmd(),
@@ -65,7 +65,7 @@ func newMountCmd() *cobra.Command {
 	var randStr, seqStr, spareStr, capacityStr string
 	c := &cobra.Command{
 		Use:   "mount <backing> <mp>",
-		Short: "挂载一个 faultfs（backing 透传），前台守护；--detach 后台运行",
+		Short: biHelp("Mount a faultfs (backing passthrough), foreground daemon; --detach to run in background", "挂载一个 faultfs（backing 透传），前台守护；--detach 后台运行"),
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			backing, mp := args[0], args[1]
@@ -110,11 +110,11 @@ func newMountCmd() *cobra.Command {
 			return faultfs.Run(mp, backing, inj)
 		},
 	}
-	c.Flags().BoolVar(&detach, "detach", false, "后台守护，立即返回")
-	c.Flags().StringVar(&randStr, "rand", "", "初始随机寻址延迟增量（ns/us/ms，如 8ms；叠加在 backing 上；空=不启用性能模拟）")
-	c.Flags().StringVar(&seqStr, "seq", "", "初始顺序读写速度上限（M=MiB/s、G=GiB/s，如 100M；空=不启用）")
-	c.Flags().StringVar(&spareStr, "spare", "", "初始备用块预算（如 8*4KiB = 8 个 4KiB 块；空=0，挂载后用 set spare 设）")
-	c.Flags().StringVar(&capacityStr, "capacity", "", "模拟容量上限（如 100M/1G；空=不限制。须 > backing 已用且 < 总量，用于模拟磁盘满）")
+	c.Flags().BoolVar(&detach, "detach", false, biHelp("Run as background daemon and return immediately", "后台守护，立即返回"))
+	c.Flags().StringVar(&randStr, "rand", "", biHelp("Initial random-seek latency increment (ns/us/ms, e.g. 8ms; added on top of backing; empty = no perf simulation)", "初始随机寻址延迟增量（ns/us/ms，如 8ms；叠加在 backing 上；空=不启用性能模拟）"))
+	c.Flags().StringVar(&seqStr, "seq", "", biHelp("Initial sequential read/write speed cap (M=MiB/s, G=GiB/s, e.g. 100M; empty = disabled)", "初始顺序读写速度上限（M=MiB/s、G=GiB/s，如 100M；空=不启用）"))
+	c.Flags().StringVar(&spareStr, "spare", "", biHelp("Initial spare-block budget (e.g. 8*4KiB = 8 blocks of 4KiB; empty = 0, set later via 'set spare')", "初始备用块预算（如 8*4KiB = 8 个 4KiB 块；空=0，挂载后用 set spare 设）"))
+	c.Flags().StringVar(&capacityStr, "capacity", "", biHelp("Simulated capacity cap (e.g. 100M/1G; empty = unlimited. Must be > backing used and < total; for simulating a full disk)", "模拟容量上限（如 100M/1G；空=不限制。须 > backing 已用且 < 总量，用于模拟磁盘满）"))
 	return c
 }
 
@@ -262,7 +262,7 @@ func waitReadyOrError(socket string, errCh <-chan error) error {
 func newUnmountCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "unmount <mp>",
-		Short: "卸载 faultfs（fusermount3 -u；挂载进程随后自动退出）",
+		Short: biHelp("Unmount faultfs (fusermount3 -u; the mount process then exits on its own)", "卸载 faultfs（fusermount3 -u；挂载进程随后自动退出）"),
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			mp := args[0]
@@ -297,7 +297,7 @@ func newAddCmd() *cobra.Command {
 	var n int
 	var heal bool
 	c := &cobra.Command{
-		Use: "add <mp>", Short: "添加一条注入规则，打印分配的 ID", Args: cobra.ExactArgs(1),
+		Use: "add <mp>", Short: biHelp("Add an injection rule and print the assigned ID", "添加一条注入规则，打印分配的 ID"), Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			errnoVal, err := parseErrno(errnoStr)
 			if err != nil {
@@ -315,13 +315,13 @@ func newAddCmd() *cobra.Command {
 			return nil
 		},
 	}
-	c.Flags().StringVar(&op, "op", "read", "open|opendir|read|readdir|write|create|lookup|mkdir|rmdir|unlink|rename|getattr|statfs|setattr|getxattr|setxattr|removexattr|listxattr|fsync|flush（空=任意 op；见 Op* 常量）")
-	c.Flags().StringVar(&path, "path", "", "挂载内相对路径子串（空=任意）")
-	c.Flags().Int64Var(&off, "off", 0, "起始 offset（仅 read/write）")
-	c.Flags().Int64Var(&offLen, "off-len", 0, "offset 区间长度（0=任意 offset；>0=区间[off,off+len)，精确点用 1）")
-	c.Flags().StringVar(&errnoStr, "errno", "EIO", "errno 名（EIO/ENOSPC/EROFS/ESTALE/...）或数字")
-	c.Flags().IntVar(&n, "n", 0, "前 N 次注入（0=永久）")
-	c.Flags().BoolVar(&heal, "heal-on-write", false, "可修复坏扇区（read EIO，write 治愈）")
+	c.Flags().StringVar(&op, "op", "read", biHelp("open|opendir|read|readdir|write|create|lookup|mkdir|rmdir|unlink|rename|getattr|statfs|setattr|getxattr|setxattr|removexattr|listxattr|fsync|flush (empty = any op; see Op* constants)", "open|opendir|read|readdir|write|create|lookup|mkdir|rmdir|unlink|rename|getattr|statfs|setattr|getxattr|setxattr|removexattr|listxattr|fsync|flush（空=任意 op；见 Op* 常量）"))
+	c.Flags().StringVar(&path, "path", "", biHelp("Relative-path substring within the mount (empty = any)", "挂载内相对路径子串（空=任意）"))
+	c.Flags().Int64Var(&off, "off", 0, biHelp("Start offset (read/write only)", "起始 offset（仅 read/write）"))
+	c.Flags().Int64Var(&offLen, "off-len", 0, biHelp("Offset range length (0 = any offset; >0 = range [off,off+len); use 1 for an exact point)", "offset 区间长度（0=任意 offset；>0=区间[off,off+len)，精确点用 1）"))
+	c.Flags().StringVar(&errnoStr, "errno", "EIO", biHelp("errno name (EIO/ENOSPC/EROFS/ESTALE/...) or number", "errno 名（EIO/ENOSPC/EROFS/ESTALE/...）或数字"))
+	c.Flags().IntVar(&n, "n", 0, biHelp("Inject only the first N times (0 = forever)", "前 N 次注入（0=永久）"))
+	c.Flags().BoolVar(&heal, "heal-on-write", false, biHelp("Repairable bad sector (read EIO, healed by write)", "可修复坏扇区（read EIO，write 治愈）"))
 	// badsector 作为 add 的子命令：坏扇区本质是"封装为 heal-on-write read 的注入规则"，
 	// 属于规则的范畴，故挂在 add 下而非 set（set 留给设备固有属性）。
 	c.AddCommand(newBadsectorCmd())
@@ -330,7 +330,7 @@ func newAddCmd() *cobra.Command {
 
 func newRmCmd() *cobra.Command {
 	return &cobra.Command{
-		Use: "rm <mp> <id>", Short: "按 ID 删除一条规则", Args: cobra.ExactArgs(2),
+		Use: "rm <mp> <id>", Short: biHelp("Delete one rule by ID", "按 ID 删除一条规则"), Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			id, err := strconv.Atoi(args[1])
 			if err != nil {
@@ -344,7 +344,7 @@ func newRmCmd() *cobra.Command {
 
 func newClearCmd() *cobra.Command {
 	return &cobra.Command{
-		Use: "clear <mp>", Short: "清空所有规则", Args: cobra.ExactArgs(1),
+		Use: "clear <mp>", Short: biHelp("Clear all rules", "清空所有规则"), Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, err := sendCtl(args[0], control.Req{Cmd: control.CmdClear})
 			return err
@@ -355,7 +355,7 @@ func newClearCmd() *cobra.Command {
 func newRefreshCmd() *cobra.Command {
 	var keepLatency bool
 	c := &cobra.Command{
-		Use: "refresh <mp>", Short: "重置所有规则到初始态（healed/remaining/spare，默认含性能参数）", Args: cobra.ExactArgs(1),
+		Use: "refresh <mp>", Short: biHelp("Reset all rules to their initial state (healed/remaining/spare; includes perf params by default)", "重置所有规则到初始态（healed/remaining/spare，默认含性能参数）"), Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resp, err := sendCtl(args[0], control.Req{Cmd: control.CmdRefreshRules, SkipLatency: keepLatency})
 			if err != nil {
@@ -373,13 +373,13 @@ func newRefreshCmd() *cobra.Command {
 			return nil
 		},
 	}
-	c.Flags().BoolVar(&keepLatency, "keep-latency", false, "保留当前性能参数（profile/speed）不动")
+	c.Flags().BoolVar(&keepLatency, "keep-latency", false, biHelp("Keep current perf params (profile/speed) unchanged", "保留当前性能参数（profile/speed）不动"))
 	return c
 }
 
 func newListCmd() *cobra.Command {
 	return &cobra.Command{
-		Use: "list <mp>", Short: "列出规则（含运行时状态）", Args: cobra.ExactArgs(1),
+		Use: "list <mp>", Short: biHelp("List rules (with runtime state)", "列出规则（含运行时状态）"), Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resp, err := sendCtl(args[0], control.Req{Cmd: control.CmdListRules})
 			if err != nil {
@@ -402,7 +402,7 @@ func newListCmd() *cobra.Command {
 func newSetCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "set",
-		Short: "设置设备固有属性（延迟/性能参数、备用扇区预算）",
+		Short: biHelp("Set inherent device attributes (latency/perf params, spare-block budget)", "设置设备固有属性（延迟/性能参数、备用扇区预算）"),
 	}
 	c.AddCommand(newSetLatencyCmd(), newSetSpareCmd())
 	return c
@@ -418,7 +418,7 @@ func newSetLatencyCmd() *cobra.Command {
 	var randStr, seqStr string
 	c := &cobra.Command{
 		Use:   "latency <mp>",
-		Short: "设设备延迟档（--profile）、倍速（--speed）或手动性能参数（--rand/--seq）",
+		Short: biHelp("Set device latency profile (--profile), global speed factor (--speed), or manual perf params (--rand/--seq)", "设设备延迟档（--profile）、倍速（--speed）或手动性能参数（--rand/--seq）"),
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			req := control.Req{Cmd: control.CmdSetLatency, Profile: profile}
@@ -452,17 +452,17 @@ func newSetLatencyCmd() *cobra.Command {
 			return nil
 		},
 	}
-	c.Flags().StringVar(&profile, "profile", "", "预设档：none|memory|ssd|hdd（空=不改）")
-	c.Flags().Float64Var(&speed, "speed", 1.0, "全局倍速（1.0 正常；>1 慢放；<1 快放）")
-	c.Flags().StringVar(&randStr, "rand", "", "随机寻址延迟（单位 ns/us/ms，如 8ms；空=不改；不可为负）")
-	c.Flags().StringVar(&seqStr, "seq", "", "顺序读写速度（单位 M=MiB/s、G=GiB/s，如 100M；空=不改；最小 1 B/s，0=不限速）")
+	c.Flags().StringVar(&profile, "profile", "", biHelp("Preset profile: none|memory|ssd|hdd (empty = no change)", "预设档：none|memory|ssd|hdd（空=不改）"))
+	c.Flags().Float64Var(&speed, "speed", 1.0, biHelp("Global speed factor (1.0 = normal; >1 = slow down; <1 = speed up)", "全局倍速（1.0 正常；>1 慢放；<1 快放）"))
+	c.Flags().StringVar(&randStr, "rand", "", biHelp("Random-seek latency (unit ns/us/ms, e.g. 8ms; empty = no change; cannot be negative)", "随机寻址延迟（单位 ns/us/ms，如 8ms；空=不改；不可为负）"))
+	c.Flags().StringVar(&seqStr, "seq", "", biHelp("Sequential read/write speed (unit M=MiB/s, G=GiB/s, e.g. 100M; empty = no change; min 1 B/s, 0 = uncapped)", "顺序读写速度（单位 M=MiB/s、G=GiB/s，如 100M；空=不改；最小 1 B/s，0=不限速）"))
 	return c
 }
 
 func newSetSpareCmd() *cobra.Command {
 	c := &cobra.Command{
 		Use:   "spare <mp> <spec>",
-		Short: "设备用块预算（<count>*<size> 如 8*4KiB，或纯数量如 8；-1 无限）；refresh 会还原到该初始值",
+		Short: biHelp("Set the spare-block budget (<count>*<size> e.g. 8*4KiB, or a plain count e.g. 8; -1 = unlimited); refresh restores this initial value", "设备用块预算（<count>*<size> 如 8*4KiB，或纯数量如 8；-1 无限）；refresh 会还原到该初始值"),
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			count, bs, err := faultfs.ParseSpareSpec(args[1])
@@ -485,7 +485,7 @@ func newBadsectorCmd() *cobra.Command {
 	var off, length int64
 	var spare string
 	c := &cobra.Command{
-		Use: "badsector <mp>", Short: "标记坏扇区（read EIO，write 治愈）：封装为 --heal-on-write read 规则", Args: cobra.ExactArgs(1),
+		Use: "badsector <mp>", Short: biHelp("Mark a bad sector (read EIO, healed by write): wrapped as a --heal-on-write read rule", "标记坏扇区（read EIO，write 治愈）：封装为 --heal-on-write read 规则"), Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			mp := args[0]
 			// 先设 spare（如指定）：坏扇区规则由 write 触发治愈并消耗 spare，故 spare 必须在
@@ -514,10 +514,10 @@ func newBadsectorCmd() *cobra.Command {
 			return nil
 		},
 	}
-	c.Flags().StringVar(&path, "path", "", "挂载内相对路径子串（必填）")
-	c.Flags().Int64Var(&off, "off", 0, "坏区起始 offset")
-	c.Flags().Int64Var(&length, "len", 4096, "坏区长度（=OffLen；治愈时按 ceil(len/blockSize) 整块消耗备用）")
-	c.Flags().StringVar(&spare, "spare", "", "备用块预算（如 8*4KiB 或 8；-1 无限；不设则不改当前预算）")
+	c.Flags().StringVar(&path, "path", "", biHelp("Relative-path substring within the mount (required)", "挂载内相对路径子串（必填）"))
+	c.Flags().Int64Var(&off, "off", 0, biHelp("Bad-sector start offset", "坏区起始 offset"))
+	c.Flags().Int64Var(&length, "len", 4096, biHelp("Bad-sector length (= OffLen; healing consumes spare in whole blocks of ceil(len/blockSize))", "坏区长度（=OffLen；治愈时按 ceil(len/blockSize) 整块消耗备用）"))
+	c.Flags().StringVar(&spare, "spare", "", biHelp("Spare-block budget (e.g. 8*4KiB or 8; -1 = unlimited; unset = leave current budget unchanged)", "备用块预算（如 8*4KiB 或 8；-1 无限；不设则不改当前预算）"))
 	// --path 必填：空 path 的规则会子串匹配任意文件，对坏扇区这种高危便捷命令而言，
 	// 忘带 --path 而静默生成"全局坏扇区"是不可接受的脚枪，故强制要求显式指定。
 	_ = c.MarkFlagRequired("path")
@@ -576,7 +576,7 @@ func parseErrno(s string) (syscall.Errno, error) {
 func newStatusCmd() *cobra.Command {
 	var asJSON bool
 	c := &cobra.Command{
-		Use: "status <mp>", Short: "概览：规则/spare/speed/profile（精简）", Args: cobra.ExactArgs(1),
+		Use: "status <mp>", Short: biHelp("Overview: rules/spare/speed/profile (compact)", "概览：规则/spare/speed/profile（精简）"), Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resp, err := sendCtl(args[0], control.Req{Cmd: control.CmdStatus})
 			if err != nil {
@@ -594,7 +594,7 @@ func newStatusCmd() *cobra.Command {
 			return nil
 		},
 	}
-	c.Flags().BoolVar(&asJSON, "json", false, "结构化 JSON 输出")
+	c.Flags().BoolVar(&asJSON, "json", false, biHelp("Structured JSON output", "结构化 JSON 输出"))
 	return c
 }
 
@@ -604,7 +604,7 @@ func newStatusCmd() *cobra.Command {
 func newDumpCmd() *cobra.Command {
 	var asJSON bool
 	c := &cobra.Command{
-		Use: "dump <mp>", Short: "全量诊断快照（规则+挂载元信息+完整延迟 profile）", Args: cobra.ExactArgs(1),
+		Use: "dump <mp>", Short: biHelp("Full diagnostic snapshot (rules + mount metadata + full latency profile)", "全量诊断快照（规则+挂载元信息+完整延迟 profile）"), Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resp, err := sendCtl(args[0], control.Req{Cmd: control.CmdDump})
 			if err != nil {
@@ -633,8 +633,15 @@ func newDumpCmd() *cobra.Command {
 			return nil
 		},
 	}
-	c.Flags().BoolVar(&asJSON, "json", false, "结构化 JSON 输出")
+	c.Flags().BoolVar(&asJSON, "json", false, biHelp("Structured JSON output", "结构化 JSON 输出"))
 	return c
+}
+
+// biHelp 把英文/中文两段帮助文案拼成"英文一行 + 换行 + 中文一行"，供 cobra Short 与
+// flag 描述使用：-h 输出先显示英文，再新起一行显示中文。flag 描述里的换行会被 pflag
+// 自动缩进对齐到描述列；Short 在命令列表里换行后第二行不缩进（cobra 模板如此），可接受。
+func biHelp(en, zh string) string {
+	return en + "\n" + zh
 }
 
 // writeJSON 以 2 空格缩进把 v 编码到 stdout。
