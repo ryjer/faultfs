@@ -29,22 +29,23 @@ type FaultNode struct {
 // 静态断言：确保覆写的方法签名与 go-fuse fs 接口严格一致——签名写错不会
 // 编译报错，而是让 go-fuse 静默回落到嵌入类型的实现（注入/延迟失效）。
 var (
-	_ fs.NodeOpener        = (*FaultNode)(nil)
-	_ fs.NodeCreater       = (*FaultNode)(nil)
-	_ fs.NodeGetattrer     = (*FaultNode)(nil)
-	_ fs.NodeStatfser      = (*FaultNode)(nil)
-	_ fs.NodeSetattrer     = (*FaultNode)(nil)
-	_ fs.NodeGetxattrer    = (*FaultNode)(nil)
-	_ fs.NodeSetxattrer    = (*FaultNode)(nil)
-	_ fs.NodeRemovexattrer = (*FaultNode)(nil)
-	_ fs.NodeListxattrer   = (*FaultNode)(nil)
-	_ fs.NodeLookuper      = (*FaultNode)(nil)
-	_ fs.NodeMkdirer       = (*FaultNode)(nil)
-	_ fs.NodeRmdirer       = (*FaultNode)(nil)
-	_ fs.NodeUnlinker      = (*FaultNode)(nil)
-	_ fs.NodeRenamer       = (*FaultNode)(nil)
-	_ fs.NodeFsyncer       = (*FaultNode)(nil)
-	_ fs.NodeFlusher       = (*FaultNode)(nil)
+	_ fs.NodeOpener         = (*FaultNode)(nil)
+	_ fs.NodeOpendirHandler = (*FaultNode)(nil)
+	_ fs.NodeCreater        = (*FaultNode)(nil)
+	_ fs.NodeGetattrer      = (*FaultNode)(nil)
+	_ fs.NodeStatfser       = (*FaultNode)(nil)
+	_ fs.NodeSetattrer      = (*FaultNode)(nil)
+	_ fs.NodeGetxattrer     = (*FaultNode)(nil)
+	_ fs.NodeSetxattrer     = (*FaultNode)(nil)
+	_ fs.NodeRemovexattrer  = (*FaultNode)(nil)
+	_ fs.NodeListxattrer    = (*FaultNode)(nil)
+	_ fs.NodeLookuper       = (*FaultNode)(nil)
+	_ fs.NodeMkdirer        = (*FaultNode)(nil)
+	_ fs.NodeRmdirer        = (*FaultNode)(nil)
+	_ fs.NodeUnlinker       = (*FaultNode)(nil)
+	_ fs.NodeRenamer        = (*FaultNode)(nil)
+	_ fs.NodeFsyncer        = (*FaultNode)(nil)
+	_ fs.NodeFlusher        = (*FaultNode)(nil)
 )
 
 // WrapChild 由 go-fuse 为每个经 Lookup/Create/Mkdir 等创建的子节点调用，把
@@ -169,6 +170,22 @@ func (n *FaultNode) Listxattr(ctx context.Context, dest []byte) (uint32, syscall
 
 // ---- 目录 / 树操作 ----
 
+// OpendirHandle 命中 opendir 规则时返回注入的 errno（不打开 backing 目录）；否则委托
+// [fs.LoopbackNode.OpendirHandle]，把返回的目录 handle 包成 [*FaultDir]，使其 readdir 也
+// 走注入。fuseFlags 原样透传 loopback 的 0：不设 FOPEN_CACHE_DIR（否则内核缓存 readdir、破坏
+// 每次注入），也不设 FOPEN_DIRECT_IO（那是文件页缓存标志，对目录条目缓存无意义）。
+func (n *FaultNode) OpendirHandle(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	n.inj.DelayOp(OpOpendir)
+	if e := n.inj.Check(OpOpendir, n.rel(), -1, 0); e != 0 {
+		return nil, 0, e
+	}
+	fh, fuseFlags, errno := n.LoopbackNode.OpendirHandle(ctx, flags)
+	if errno != 0 {
+		return nil, 0, errno
+	}
+	return &FaultDir{inner: fh, inj: n.inj, path: n.rel(), backing: n.backing}, fuseFlags, 0
+}
+
 func (n *FaultNode) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
 	n.inj.DelayOp(OpLookup)
 	if e := n.inj.Check(OpLookup, filepath.Join(n.rel(), name), -1, 0); e != 0 {
@@ -225,7 +242,7 @@ func (n *FaultNode) Flush(ctx context.Context, f fs.FileHandle) syscall.Errno {
 		return e
 	}
 	if fh, ok := f.(*FaultFile); ok {
-		return fh.LoopbackFile.Flush(ctx)
+		return fh.Flush(ctx)
 	}
 	return 0
 }

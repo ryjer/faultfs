@@ -38,7 +38,7 @@ func TestControlOnline_AddAndInject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if _, err := f.ReadAt(make([]byte, 4), 0); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("read = %v, want EIO (injected via control socket)", err)
 	}
@@ -52,7 +52,7 @@ func TestControlOnline_AddAndInject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open after clear: %v", err)
 	}
-	defer f2.Close()
+	defer func() { _ = f2.Close() }()
 	if _, err := f2.ReadAt(make([]byte, 4), 0); err != nil {
 		t.Fatalf("read after clear = %v, want nil", err)
 	}
@@ -158,7 +158,7 @@ func TestControlOnline_RefreshAndSpareBlocks(t *testing.T) {
 	if _, err := f.ReadAt(make([]byte, 4096), 0); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("read = %v, want EIO", err)
 	}
-	f.Close()
+	_ = f.Close()
 	// 写 → 治愈，消耗 1 块，spare 4→3。
 	f2, err := os.OpenFile(p, os.O_WRONLY, 0)
 	if err != nil {
@@ -167,7 +167,7 @@ func TestControlOnline_RefreshAndSpareBlocks(t *testing.T) {
 	if _, err := f2.WriteAt([]byte("x"), 0); err != nil {
 		t.Fatalf("write heal = %v, want nil", err)
 	}
-	f2.Close()
+	_ = f2.Close()
 	if st, _ := control.Send(sock, control.Req{Cmd: control.CmdStatus}); st.Spare != 3 {
 		t.Fatalf("spare after heal = %d, want 3", st.Spare)
 	}

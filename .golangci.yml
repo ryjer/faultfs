@@ -1,0 +1,27 @@
+# golangci-lint 配置（v2 schema；需 golangci-lint >= 2.0）
+# 文档：https://golangci-lint.run/usage/configuration/
+#
+# 跑法：golangci-lint run
+
+version: "2"
+
+run:
+  timeout: 5m
+  # 不下载模块：CI/离线环境更稳，依赖由 go mod tidy 预先就位。
+  modules-download-mode: readonly
+
+linters:
+  # 不启用默认集，改为显式 enable——避免升级 golangci-lint 时默认集变化带来未预期的噪声。
+  default: none
+  enable:
+    - errcheck      # 未检查的错误返回值（本仓库已清零，保持）
+    - govet         # go vet
+    - staticcheck   # 综合静态分析（v2 已合并 gosimple/stylecheck；含 QF1xxx 简化等建议）
+    - ineffassign   # 无效赋值
+    - unused        # 未使用的代码
+
+issues:
+  # 不按 issue 文本去重截断。golangci-lint 默认 max-same-issues=3 曾掩盖过同类重复问题
+  # （例如多处 unchecked defer Close 只报前 3 个），这里全部放开，确保同类问题一次性暴露。
+  max-issues-per-linter: 0
+  max-same-issues: 0

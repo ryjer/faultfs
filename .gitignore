@@ -9,3 +9,7 @@ coverage.html
 # 编辑器 / 系统
 .*.swp
 .DS_Store
+
+# 中间文件
+prd.md
+需求文档.md

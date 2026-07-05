@@ -649,8 +649,8 @@ func Calibrate(backing string) (randLatency time.Duration, seqBw float64, err er
 	if err != nil {
 		return 0, 0, err
 	}
-	defer os.Remove(f.Name())
-	defer f.Close()
+	defer func() { _ = os.Remove(f.Name()) }()
+	defer func() { _ = f.Close() }()
 
 	buf := make([]byte, calibBlock)
 	// 预分配 calibSeqSize（Truncate 建稀疏文件），再用各不相同的块填充，避免稀疏/

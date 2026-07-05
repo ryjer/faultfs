@@ -4,7 +4,7 @@
 系统错误**（EIO/ENOSPC/EROFS/ESTALE/…）与**可调设备性能**的测试使用。它把一个
 “按规则返回任意 errno、按延迟模型 sleep”的 loopback 挂到某挂载点，backing 目录
 内容透传。把它当作被测系统（如 [FSS](https://github.com/ryjer/fss) 的 raif）的某
-块物理盘，被测系统对该盘的 syscall（`Open`/`Read`/`Write`/`Getattr`/`Statfs`/
+块物理盘，被测系统对该盘的 syscall（`Open`/`Opendir`/`Read`/`Readdir`/`Write`/`Getattr`/`Statfs`/
 xattr/`Create`/`Mkdir`/`Unlink`/`Rename`）经内核路由到 faultfs，返回的 errno 就是
 它看到的真实文件系统错误（`os.PathError{Err: syscall.EIO}`），与底层真盘报错不可
 区分——这强于在被测系统内部伪造错误的单元测试钩子。
@@ -54,6 +54,7 @@ inj.SetSpeed(2.0) // 慢放 2 倍
 ```sh
 faultfs mount <backing> <mp> [--detach] [--capacity 100M]   # 挂载守护；--capacity 模拟容量（写满 ENOSPC）
 faultfs add <mp> --op read --path a.bin --errno EIO            # 加规则，打印 ID
+faultfs add <mp> --op opendir --path d --errno EIO           # 目录读取也注入（opendir/readdir）
 faultfs add badsector <mp> --path a.bin --off 4096 --len 4096      # 坏扇区（read EIO, write 治愈）
 faultfs set latency <mp> --profile hdd --speed 2.0                 # 设备档 + 倍速
 faultfs set spare <mp> 4                                          # 备用扇区预算（-1 无限）

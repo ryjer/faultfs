@@ -31,8 +31,8 @@ func TestHealOnWrite_RefreshResets(t *testing.T) {
 	inj := NewInjector()
 	inj.SetSpare(-1) // 默认 spare=0；这里需无限预算以验证治愈→重置语义
 	inj.Add(Rule{Op: OpRead, Path: "f", Errno: syscall.EIO, HealOnWrite: true})
-	inj.Check(OpRead, "f", 0, 1)
-	inj.Check(OpWrite, "f", 0, 1) // 治愈
+	_ = inj.Check(OpRead, "f", 0, 1)
+	_ = inj.Check(OpWrite, "f", 0, 1) // 治愈
 	if e := inj.Check(OpRead, "f", 0, 1); e != 0 {
 		t.Fatal("should be healed before refresh")
 	}
@@ -63,8 +63,8 @@ func TestSpareDecrements(t *testing.T) {
 	inj.SetSpare(2)
 	inj.Add(Rule{Op: OpRead, Path: "a", Errno: syscall.EIO, HealOnWrite: true})
 	inj.Add(Rule{Op: OpRead, Path: "b", Errno: syscall.EIO, HealOnWrite: true})
-	inj.Check(OpWrite, "a", 0, 1)
-	inj.Check(OpWrite, "b", 0, 1)
+	_ = inj.Check(OpWrite, "a", 0, 1)
+	_ = inj.Check(OpWrite, "b", 0, 1)
 	if got := inj.Spare(); got != 0 {
 		t.Fatalf("spare = %d, want 0 after 2 heals", got)
 	}
@@ -120,7 +120,7 @@ func TestCheckConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			inj.Check(OpRead, "f", int64(i), 1)
+			_ = inj.Check(OpRead, "f", int64(i), 1)
 		}(i)
 	}
 	wg.Add(1)
@@ -208,9 +208,9 @@ func TestRefreshReturnsEntries(t *testing.T) {
 	idUntouched := inj.Add(Rule{Op: OpRead, Path: "u", Errno: syscall.ENOSPC}) // 从不命中，状态不变
 
 	// 触发变动：治愈 h、消耗 n 两次。
-	inj.Check(OpWrite, "h", 0, 1) // 治愈 h
-	inj.Check(OpRead, "n", 0, 1)
-	inj.Check(OpRead, "n", 0, 1)
+	_ = inj.Check(OpWrite, "h", 0, 1) // 治愈 h
+	_ = inj.Check(OpRead, "n", 0, 1)
+	_ = inj.Check(OpRead, "n", 0, 1)
 
 	res := inj.Refresh(RefreshOptions{})
 	gotRule := map[int]string{} // rule id -> "Before->After"
@@ -248,7 +248,7 @@ func TestRefreshReturnsEntries(t *testing.T) {
 	// 让 spare 被消耗：有限 spare + 治愈，再 Refresh 应报 spare 条目（before≠after）。
 	inj.SetSpare(2)
 	inj.Add(Rule{Op: OpRead, Path: "x", Errno: syscall.EIO, HealOnWrite: true})
-	inj.Check(OpWrite, "x", 0, 1) // 消耗 1，spare 2→1
+	_ = inj.Check(OpWrite, "x", 0, 1) // 消耗 1，spare 2→1
 	res2 := inj.Refresh(RefreshOptions{})
 	var sawSpare bool
 	for _, e := range res2.Entries {
@@ -270,7 +270,7 @@ func TestRefreshSkipLatency(t *testing.T) {
 	inj.SetProfile(ProfileSSD) // current=initial=ssd（setter 同步 initial）
 	inj.SetSpare(2)
 	inj.Add(Rule{Op: OpRead, Path: "h", Errno: syscall.EIO, HealOnWrite: true})
-	inj.Check(OpWrite, "h", 0, 1) // 治愈：消耗 1 块，spare 2→1
+	_ = inj.Check(OpWrite, "h", 0, 1) // 治愈：消耗 1 块，spare 2→1
 
 	// SkipLatency=true：rule（治愈复位）与 spare（1→2）条目必须照常出现，
 	// 证明 SkipLatency 只跳过 latency、不抑制 rule/spare 复位。

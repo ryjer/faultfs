@@ -81,11 +81,11 @@ func newMountCmd() *cobra.Command {
 					return
 				}
 				if ok {
-					statusW.WriteString("1")
+					_, _ = statusW.WriteString("1")
 				} else {
-					statusW.WriteString("0" + msg)
+					_, _ = statusW.WriteString("0" + msg)
 				}
-				statusW.Close()
+				_ = statusW.Close()
 			}
 			inj, warns, err := buildInjector(backing, randStr, seqStr, spareStr, capacityStr)
 			if err != nil {
@@ -200,14 +200,14 @@ func detachSelf(backing, mp string, extraArgs []string) error {
 	c.Env = append(os.Environ(), detachStatusFDEnv+"=3")
 	c.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := c.Start(); err != nil {
-		pr.Close()
-		pw.Close()
+		_ = pr.Close()
+		_ = pw.Close()
 		return fmt.Errorf("detach: %w", err)
 	}
 	pid := c.Process.Pid
-	pw.Close() // 父进程只读
+	_ = pw.Close() // 父进程只读
 	data, _ := io.ReadAll(pr)
-	pr.Close()
+	_ = pr.Close()
 	sock := control.SocketPath(mp)
 	if len(data) == 0 {
 		_ = c.Wait()
@@ -315,7 +315,7 @@ func newAddCmd() *cobra.Command {
 			return nil
 		},
 	}
-	c.Flags().StringVar(&op, "op", "read", "open|read|write|create|getattr|statfs|getxattr|setxattr|...")
+	c.Flags().StringVar(&op, "op", "read", "open|opendir|read|readdir|write|create|lookup|mkdir|rmdir|unlink|rename|getattr|statfs|setattr|getxattr|setxattr|removexattr|listxattr|fsync|flush（空=任意 op；见 Op* 常量）")
 	c.Flags().StringVar(&path, "path", "", "挂载内相对路径子串（空=任意）")
 	c.Flags().Int64Var(&off, "off", 0, "起始 offset（仅 read/write）")
 	c.Flags().Int64Var(&offLen, "off-len", 0, "offset 区间长度（0=任意 offset；>0=区间[off,off+len)，精确点用 1）")

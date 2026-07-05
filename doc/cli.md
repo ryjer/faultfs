@@ -104,10 +104,44 @@ $ dd if=$MP/blob.bin of=/dev/null bs=4096 count=1
 dd: failed to open '$MP/blob.bin': Stale file handle
 ```
 
-> `--op` 可取：`open read write create lookup mkdir rmdir unlink rename getattr statfs
+> `--op` 可取：`open opendir read readdir write create lookup mkdir rmdir unlink rename getattr statfs
 > setattr getxattr setxattr removexattr listxattr fsync flush`（空=任意 op）。
 > `--errno` 取名称（`EIO/ENOSPC/EROFS/ESTALE/EUCLEAN/ENODEV/EACCES/EPERM/ENOSYS/EFBIG/EDQUOT`，
 > 大小写不敏感）或数字。
+
+### 目录读取返回 EIO（`opendir` / `readdir`）
+
+列目录故障有两个粒度，分别命中 readdir 链路的不同环节。`opendir`——打开目录即失败（不打开
+backing 目录）：
+
+```sh
+faultfs clear $MP
+faultfs add $MP --op opendir --path adir --errno EIO
+ls $MP/adir
+```
+
+```
+$ ls $MP/adir
+ls: cannot open directory '$MP/adir': Input/output error
+```
+
+`readdir` 更细：`opendir` 成功、但读取条目（getdents）失败，模拟"打开正常、读到一半失败"：
+
+```sh
+faultfs clear $MP
+faultfs add $MP --op readdir --path adir --errno EIO
+ls $MP/adir
+```
+
+```
+$ ls $MP/adir
+ls: reading directory '$MP/adir': Input/output error
+```
+
+> `opendir` 每次新调，注入稳定。`readdir` 推荐永久规则（默认 `--n 0`）：go-fuse bridge 仅在
+> 每轮 READDIR 的首个 getdents 返 errno 时透传给内核，轮次中途的 errno 会被吞掉——永久规则下
+> 首个条目即 EIO，错误稳定传播。`--path` 仍是子串匹配（如 `hash` 命中 `hash/md5/ab/cd`），可让
+> "某盘某子树 opendir 失败、合并挂载跳过该盘"这类测试精确命中。
 
 ## 5. 前N次注入后自愈（`--n`）
 
@@ -294,6 +328,7 @@ $ getfattr -n user.k $MP/adir               # → 命中注入：ENODATA（No da
 | 前 N 次后自愈 | `faultfs add $MP --op read --errno EIO --n 3` |
 | 可治愈坏扇区 | `faultfs add badsector $MP --path f --off 4096 --len 4096` |
 | xattr 错误 | `faultfs add $MP --op setxattr --path f --errno E2BIG`（文件/目录均可） |
+| 目录读取 EIO | `faultfs add $MP --op opendir --path d --errno EIO`（`--op readdir`：opendir 正常、列条目 EIO） |
 | 备用块预算 | `faultfs set spare $MP 8*4KiB`（或 `mount --spare 8*4KiB`；`refresh` 还原） |
 | 性能模拟 | `faultfs set latency $MP --rand 8ms --seq 100M`（rand=叠加增量、seq=速度上限） |
 | 模拟磁盘满 | `faultfs mount $BD $MP --capacity 10M`（写满自动 ENOSPC、df 见 10M） |

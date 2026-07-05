@@ -13,8 +13,10 @@ import (
 // 故障注入点：Rule.Op 取这些值之一，或 "" 表示任意 op。
 const (
 	OpOpen        = "open"
+	OpOpendir     = "opendir"
 	OpCreate      = "create"
 	OpRead        = "read"
+	OpReaddir     = "readdir"
 	OpWrite       = "write"
 	OpLookup      = "lookup"
 	OpMkdir       = "mkdir"

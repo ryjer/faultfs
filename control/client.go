@@ -12,7 +12,7 @@ func Send(socket string, req Req) (Resp, error) {
 	if err != nil {
 		return resp, err
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	if err := json.NewEncoder(c).Encode(req); err != nil {
 		return resp, err
 	}

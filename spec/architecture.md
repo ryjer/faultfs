@@ -110,7 +110,7 @@ faultfs     ──►  control   （handleControl 用 control.Req/Resp）
 control     ──►  （仅标准库；刻意不 import faultfs，避免循环依赖）
 ```
 
-- **`faultfs`**（库）：`Injector`（规则+性能模型）、`FaultNode`/`FaultFile`（FUSE 回调）、
+- **`faultfs`**（库）：`Injector`（规则+性能模型）、`FaultNode`/`FaultFile`/`FaultDir`（FUSE 回调）、
   `latency.go`（profile/校准/钳制）、`Mount`/`Run`/`MountT`、`handleControl`。被测系统与
   Go 测试直接用它。
 - **`control`**（协议+传输）：`Req`/`Resp`/`Cmd`、`Server`、`Send`、`SocketPath`。纯协议层，
@@ -124,6 +124,11 @@ control     ──►  （仅标准库；刻意不 import faultfs，避免循环
 - **指针嵌入而非继承**：`FaultNode` 嵌入 `*fs.LoopbackNode`、`FaultFile` 嵌入
   `*fs.LoopbackFile`，继承全部 loopback 行为，只覆写被测数据通路用到的 op。未覆写的 op 自动
   透传。配 `var _ fs.NodeXxx = (*FaultNode)(nil)` 静态断言，防签名写错时静默回落到嵌入实现。
+  **`FaultDir` 是例外**：go-fuse loopback 的目录 handle 是未导出的 `*loopbackDirStream`（非
+  `*LoopbackFile`），无法嵌入；故 `FaultDir` 以 `fs.FileHandle` 接口持有 `OpendirHandle` 的
+  返回值，经类型断言委托 `Readdirent`/`Seekdir`/`Releasedir`/`Fsyncdir`，并在 `Readdirent`
+  注入 `OpReaddir`（`OpOpendir` 在 `FaultNode.OpendirHandle` 节点级注入）。`Releasedir` 是目录
+  handle 接口里唯一无返回值的方法，靠静态断言防漏委托致 fd 泄漏。
 - **配置/状态分离 + Refresh**：`Rule`（配置）与 `ruleState`（运行时 `remaining`/`healed`）
   分开，`Refresh` 只重置运行时状态与 `spare`，配置不变——用于"治愈→刷新→再次故障"反复重放。
 - **坏扇区有状态模型（按块治愈）**：`HealOnWrite` 把 read 规则变成"read EIO / write 治愈"的真实硬盘

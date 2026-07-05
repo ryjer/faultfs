@@ -59,7 +59,7 @@ func (s *Server) Serve() {
 }
 
 func (s *Server) handle(c net.Conn) {
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	var req Req
 	if err := json.NewDecoder(bufio.NewReader(c)).Decode(&req); err != nil {
 		_ = json.NewEncoder(c).Encode(Resp{OK: false, Err: "bad request: " + err.Error()})

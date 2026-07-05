@@ -7,7 +7,7 @@
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `Op` | string | 操作类型：`open`/`read`/`write`/`create`/`lookup`/`mkdir`/`rmdir`/`unlink`/`rename`/`getattr`/`statfs`/`getxattr`/`setxattr`/`removexattr`/`listxattr`；`""`=任意 op |
+| `Op` | string | 操作类型：`open`/`opendir`/`read`/`readdir`/`write`/`create`/`lookup`/`mkdir`/`rmdir`/`unlink`/`rename`/`getattr`/`statfs`/`setattr`/`getxattr`/`setxattr`/`removexattr`/`listxattr`/`fsync`/`flush`；`""`=任意 op |
 | `Path` | string | 挂载内相对路径**子串**；`""`=任意路径。如 `"blob.bin"` 命中 `"data/blob.bin"` |
 | `Off`, `OffLen` | int64 | 仅 read/write：`OffLen<=0`=任意 offset（零值默认）；`OffLen>0`=区间 `[Off, Off+OffLen)`。精确点用 `OffLen:1` |
 | `Errno` | syscall.Errno | 命中时返回的 errno（不可为 0） |

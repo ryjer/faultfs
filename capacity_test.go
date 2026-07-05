@@ -131,7 +131,7 @@ func TestCapacityWriteENOSPC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if _, err := f.WriteAt(make([]byte, 4096), 0); !errors.Is(err, syscall.ENOSPC) {
 		t.Fatalf("write 4KiB over cap(used+100B) = %v, want ENOSPC", err)
 	}
@@ -144,7 +144,7 @@ func TestCapacityFallocateENOSPC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	err = syscall.Fallocate(int(f.Fd()), 0, 0, 1<<20)
 	if errors.Is(err, syscall.ENOSPC) {
 		return // 预期：容量门拦截 fallocate
@@ -165,7 +165,7 @@ func TestCapacityBurstWriteNoOvershoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	// 4 块 64KiB = 256KiB；headroom 128KiB → 应在第 3 块 ENOSPC，落盘 ~128KiB。
 	var landed int64
 	for i := 0; i < 4; i++ {
@@ -197,7 +197,7 @@ func TestHealOnWriteThenENOSPCAtomicity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	inj.SetSpare(-1)
 	inj.Add(Rule{Op: OpRead, Path: "f", Off: 0, OffLen: 4096, Errno: syscall.EIO, HealOnWrite: true})

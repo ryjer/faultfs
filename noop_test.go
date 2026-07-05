@@ -78,7 +78,7 @@ func TestNoOpOpsReachFaultfs(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		_, err = f.WriteAt([]byte(orig), 0)
 		return err
 	})
@@ -112,7 +112,7 @@ func TestNoOpWritePersistsToBacking(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = f.WriteAt([]byte(orig), 0)
-	f.Close()
+	_ = f.Close()
 	if err != nil {
 		t.Fatalf("write 同字节（无规则）：%v", err)
 	}

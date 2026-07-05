@@ -36,7 +36,7 @@ func TestServerClientRoundTrip(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 	go s.Serve()
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	// add → ID 1
 	resp, err := Send(sock, Req{Cmd: CmdAddRule, Op: "read", Errno: 5})
@@ -85,7 +85,7 @@ func TestServerClientDump(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 	go s.Serve()
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 
 	resp, err := Send(sock, Req{Cmd: CmdDump})
 	if err != nil {

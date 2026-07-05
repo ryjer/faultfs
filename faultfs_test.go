@@ -61,7 +61,7 @@ func TestInjectReadEIO(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	_, err = f.ReadAt(make([]byte, 4096), 0)
 	if !errors.Is(err, syscall.EIO) {
 		t.Fatalf("read = %v, want EIO", err)
@@ -79,7 +79,7 @@ func TestInjectWriteENOSPC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if _, err := f.WriteAt([]byte("x"), 0); !errors.Is(err, syscall.ENOSPC) {
 		t.Fatalf("write = %v, want ENOSPC", err)
 	}
@@ -150,7 +150,7 @@ func TestInjectThenRecover(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if _, err := f.ReadAt(make([]byte, 4096), 0); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("first read = %v, want EIO", err)
 	}
@@ -174,7 +174,7 @@ func TestPathFilter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open a: %v", err)
 	}
-	defer fa.Close()
+	defer func() { _ = fa.Close() }()
 	if _, err := fa.ReadAt(make([]byte, 4096), 0); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("read a = %v, want EIO", err)
 	}
@@ -183,7 +183,7 @@ func TestPathFilter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open b: %v", err)
 	}
-	defer fb.Close()
+	defer func() { _ = fb.Close() }()
 	if _, err := fb.ReadAt(make([]byte, 4096), 0); err != nil {
 		t.Fatalf("read b = %v, want nil (path filter excludes b)", err)
 	}
@@ -200,7 +200,7 @@ func TestOffsetFilter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if _, err := f.ReadAt(make([]byte, 4096), 0); err != nil {
 		t.Fatalf("read@0 = %v, want nil", err)
 	}
@@ -223,7 +223,7 @@ func TestOffsetRange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if _, err := f.ReadAt(make([]byte, 4096), 4096); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("read@4096 = %v, want EIO (inside range)", err)
 	}
@@ -255,7 +255,7 @@ func TestMultipleRules(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open a: %v", err)
 	}
-	defer fa.Close()
+	defer func() { _ = fa.Close() }()
 	if _, err := fa.ReadAt(make([]byte, 4096), 0); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("read a = %v, want EIO", err)
 	}
@@ -265,7 +265,7 @@ func TestMultipleRules(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open b: %v", err)
 	}
-	defer fb.Close()
+	defer func() { _ = fb.Close() }()
 	if _, err := fb.WriteAt([]byte("x"), 0); !errors.Is(err, syscall.ENOSPC) {
 		t.Fatalf("write b = %v, want ENOSPC", err)
 	}
@@ -291,7 +291,7 @@ func TestMultipleMounts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open mp1: %v", err)
 	}
-	defer f1.Close()
+	defer func() { _ = f1.Close() }()
 	if _, err := f1.ReadAt(make([]byte, 4096), 0); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("mp1 read = %v, want EIO", err)
 	}
@@ -300,7 +300,7 @@ func TestMultipleMounts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open mp2: %v", err)
 	}
-	defer f2.Close()
+	defer func() { _ = f2.Close() }()
 	if _, err := f2.ReadAt(make([]byte, 4096), 0); err != nil {
 		t.Fatalf("mp2 read = %v, want nil (isolated)", err)
 	}
