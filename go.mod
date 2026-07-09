@@ -1,6 +1,6 @@
 module github.com/ryjer/faultfs
 
-go 1.25.0
+go 1.21
 
 require github.com/hanwen/go-fuse/v2 v2.10.1
 
