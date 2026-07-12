@@ -1,4 +1,5 @@
 # 构建产物
+/bin
 /faultfs
 *.test
 *.out
